@@ -63,3 +63,6 @@ def check_key_online(key: str, api_url: str):
         return False, f"❌ Lỗi mạng: {str(e)}", {}
     except Exception as e:
         return False, f"⚠️ Lỗi không xác định: {str(e)}", {}
+
+
+        

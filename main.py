@@ -477,7 +477,7 @@ def read_excel_img2img_data(excel_file_path='prompt_image.xlsx'):
         log_error(f"Lỗi khi đọc file Excel: {e}")
         return []
 
-def generate_image(access_token, prompt, seed, max_retries=3):
+def generate_image(access_token, prompt, seed, aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE", max_retries=3):
     """Gọi API để tạo ảnh với cơ chế retry"""
     url = "https://aisandbox-pa.googleapis.com/v1/whisk:generateImage"
     
@@ -498,7 +498,7 @@ def generate_image(access_token, prompt, seed, max_retries=3):
             },
             "imageModelSettings": {
                 "imageModel": image_model,
-                "aspectRatio": "IMAGE_ASPECT_RATIO_LANDSCAPE"
+                "aspectRatio": aspect_ratio
             },
             "seed": seed,
             "prompt": prompt,
@@ -720,7 +720,47 @@ def upload_image_to_google_labs(cookie, image_path, caption="A hyperrealistic di
         log_error(f"Lỗi khi upload ảnh: {e}")
         return None
 
-def generate_image_from_image(access_token, upload_data, user_instruction, seed):
+def generate_image_from_multiple_images(access_token, upload_data_list, user_instruction, seed, image_model="IMAGEN_3_5", aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE"):
+    """Tạo ảnh từ nhiều ảnh đã upload"""
+    url = "https://aisandbox-pa.googleapis.com/v1/whisk:runImageRecipe"
+    
+    headers = browser_sim.get_api_headers(access_token=access_token)
+    
+    # Tạo recipeMediaInputs từ upload_data_list
+    recipe_media_inputs = []
+    for upload_data in upload_data_list:
+        recipe_media_inputs.append({
+            "caption": upload_data.get('caption', ''),
+            "mediaInput": {
+                "mediaCategory": upload_data['mediaCategory'],
+                "mediaGenerationId": upload_data['uploadMediaGenerationId']
+            }
+        })
+    
+    payload = {
+        "clientContext": {
+            "workflowId": upload_data_list[0]['workflowId'] if upload_data_list else "",
+            "tool": "BACKBONE",
+            "sessionId": upload_data_list[0]['sessionId'] if upload_data_list else ""
+        },
+        "seed": seed,
+        "imageModelSettings": {
+            "imageModel": image_model,
+            "aspectRatio": aspect_ratio
+        },
+        "userInstruction": user_instruction,
+        "recipeMediaInputs": recipe_media_inputs
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        log_error(f"Lỗi khi tạo ảnh từ nhiều ảnh: {e}")
+        return None
+
+def generate_image_from_image(access_token, upload_data, user_instruction, seed, image_model="IMAGEN_3_5", aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE"):
     """Tạo ảnh từ ảnh đã upload"""
     url = "https://aisandbox-pa.googleapis.com/v1/whisk:runImageRecipe"
     
@@ -735,7 +775,7 @@ def generate_image_from_image(access_token, upload_data, user_instruction, seed)
         "seed": seed,
         "imageModelSettings": {
             "imageModel": image_model,
-            "aspectRatio": "IMAGE_ASPECT_RATIO_LANDSCAPE"
+            "aspectRatio": aspect_ratio
         },
         "userInstruction": user_instruction,
         "recipeMediaInputs": [
@@ -743,6 +783,20 @@ def generate_image_from_image(access_token, upload_data, user_instruction, seed)
                 "caption": upload_data.get('caption', ''),
                 "mediaInput": {
                     "mediaCategory": "MEDIA_CATEGORY_SUBJECT",
+                    "mediaGenerationId": upload_data['uploadMediaGenerationId']
+                }
+            },
+            {
+                "caption": upload_data.get('caption', ''),
+                "mediaInput": {
+                    "mediaCategory": "MEDIA_CATEGORY_SCENE",
+                    "mediaGenerationId": upload_data['uploadMediaGenerationId']
+                }
+            },
+            {
+                "caption": upload_data.get('caption', ''),
+                "mediaInput": {
+                    "mediaCategory": "MEDIA_CATEGORY_STYLE",
                     "mediaGenerationId": upload_data['uploadMediaGenerationId']
                 }
             }
@@ -789,470 +843,7 @@ def sanitize_filename(stt_value, prompt_text, max_prompt_length=80):
         safe = 'image'
     return f"{stt_value}_{safe}.jpg"
 
-def get_next_seed():
-    """Thread-safe function để lấy seed tiếp theo"""
-    global current_seed
-    with seed_lock:
-        seed = current_seed
-        current_seed += 1
-        return seed
-
-def process_single_image_task(task_data):
-    """Xử lý một task tạo ảnh trong thread"""
-    stt, prompt, access_token, output_folder = task_data
-    
-    try:
-        # Lấy seed thread-safe
-        seed = get_next_seed()
-        
-        # Gọi API tạo ảnh
-        result = generate_image(access_token, prompt, seed)
-        
-        if result and 'imagePanels' in result:
-            for panel_idx, panel in enumerate(result['imagePanels']):
-                if 'generatedImages' in panel:
-                    for img_idx, img in enumerate(panel['generatedImages']):
-                        if 'encodedImage' in img:
-                            filename = sanitize_filename(stt, prompt)
-                            success = save_base64_image(img['encodedImage'], filename, output_folder)
-                            if success:
-                                log_success(f"✅ [Thread] Đã lưu thành công: {filename}")
-                                return True
-                            else:
-                                log_error(f"❌ [Thread] Lỗi khi lưu: {filename}")
-                                return False
-                        else:
-                            log_error(f"[Thread] Ảnh {img_idx} không có encodedImage")
-                else:
-                    log_error(f"[Thread] Panel {panel_idx} không có generatedImages")
-        else:
-            log_error(f"[Thread] Response không có imagePanels cho STT {stt}")
-            return False
-            
-    except Exception as e:
-        log_error(f"[Thread] Lỗi khi xử lý STT {stt}: {e}")
-        return False
-
-def process_single_img2img_task(task_data):
-    """Xử lý một task tạo ảnh từ ảnh trong thread"""
-    stt, prompt, image_path, access_token, cookie, output_folder = task_data
-    
-    try:
-        # Kiểm tra file ảnh có tồn tại không
-        if not os.path.exists(image_path):
-            log_error(f"[Thread] Không tìm thấy file ảnh: {image_path}")
-            return False
-        
-        # Lấy seed thread-safe
-        seed = get_next_seed()
-        
-        # Upload ảnh lên Google Labs
-        log_info(f"[Thread] Đang upload ảnh: {os.path.basename(image_path)}")
-        upload_data = upload_image_to_google_labs(cookie, image_path, caption="A hyperrealistic digital illustration depicts a shiny, chrome-like mouse character, standing confidently in a martial arts gi against a subtly rendered, dark background of what appears to be an arena. The character, positioned centrally in the frame, faces forward with a slight tilt of its head to the right. Its body is composed of a highly reflective, polished silver material, giving it a metallic, almost liquid sheen.\n\nThe mouse has large, round ears that match its reflective silver body. Its face is characterized by large, expressive eyes with black pupils surrounded by a thin white iris, and a faint, thin black eyebrow line above each eye. A small, dark triangular nose sits above a tiny, closed mouth. Whiskers, depicted as thin black lines, extend from its cheeks. The overall expression of the mouse is one of determination or seriousness.\n\nIt wears a dark, possibly black or very dark gray, martial arts gi. The gi consists of a wrap-around top with a V-neck opening and wide sleeves, secured at the waist by a tied belt with a knot at the front. The fabric of the gi has visible texture, with distinct lines and shading suggesting folds and creases, giving it a somewhat sketch-like or illustrated appearance in contrast to the smooth, reflective quality of the mouse's skin. The gi extends down to just above its feet. The mouse's feet are clad in simple, low-top white sneakers with dark soles, contrasting with the dark gi.\n\nThe background is dark and desaturated, creating a stark contrast with the shiny character. It suggests the interior of an arena or training dojo, with a circular, slightly elevated platform visible in the foreground where the mouse stands. The background features blurred architectural elements, possibly seating or walls, rendered in shades of dark gray and black. A faint \"SU\" logo, stylized in white, is visible in the upper right corner of the image. The lighting appears to come from the front and slightly above, accentuating the metallic sheen of the mouse and casting subtle shadows.")
-        
-        if not upload_data:
-            log_error(f"[Thread] Không thể upload ảnh: {image_path}")
-            return False
-        
-        # Tạo ảnh từ ảnh
-        result = generate_image_from_image(access_token, upload_data, prompt, seed)
-        
-        if result and 'imagePanels' in result:
-            for panel in result['imagePanels']:
-                if 'generatedImages' in panel:
-                    for img in panel['generatedImages']:
-                        if 'encodedImage' in img:
-                            filename = sanitize_filename(stt, prompt)
-                            success = save_base64_image(img['encodedImage'], filename, output_folder)
-                            if success:
-                                log_success(f"✅ [Thread] Đã lưu thành công: {filename}")
-                                return True
-                            else:
-                                log_error(f"❌ [Thread] Lỗi khi lưu: {filename}")
-                                return False
-        else:
-            log_error(f"[Thread] Response không có imagePanels cho STT {stt}")
-            return False
-            
-    except Exception as e:
-        log_error(f"[Thread] Lỗi khi xử lý STT {stt}: {e}")
-        return False
-
-
-def toggle_debug_mode():
-    """Bật/tắt chế độ debug"""
-    current_status = "BẬT" if log_config.DEBUG else "TẮT"
-    print(f"\n{Fore.YELLOW}🔧 Cấu hình Debug Mode:{Style.RESET_ALL}")
-    print(f"Trạng thái hiện tại: {Fore.CYAN}{current_status}{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}1.{Style.RESET_ALL} Bật debug (hiển thị log chi tiết)")
-    print(f"{Fore.CYAN}2.{Style.RESET_ALL} Tắt debug (chỉ hiển thị lỗi)")
-    print(f"{Fore.CYAN}3.{Style.RESET_ALL} Quay lại menu chính")
-    
-    while True:
-        choice = input(f"\n{Fore.GREEN}Chọn (1/2/3): {Style.RESET_ALL}").strip()
-        if choice == '1':
-            log_config.DEBUG = True
-            log_success("Đã bật chế độ debug - sẽ hiển thị log chi tiết")
-            return True
-        elif choice == '2':
-            log_config.DEBUG = False
-            log_success("Đã tắt chế độ debug - chỉ hiển thị lỗi và thông tin quan trọng")
-            return True
-        elif choice == '3':
-            return False
-        else:
-            print(f"{Fore.RED}Lựa chọn không hợp lệ! Vui lòng chọn 1, 2 hoặc 3.{Style.RESET_ALL}")
-
-def show_main_menu(current_excel_file='prompt_image.xlsx'):
-    """Hiển thị menu chính"""
-    print(f"\n{Fore.YELLOW}🎨 Chọn chế độ tạo ảnh:{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}1.{Style.RESET_ALL} Tạo ảnh từ prompt (Excel) - Multi-threading")
-    print(f"{Fore.CYAN}2.{Style.RESET_ALL} Tạo ảnh từ Prompt + Image (Image-to-Image) - Multi-threading")
-    print(f"{Fore.CYAN}3.{Style.RESET_ALL} Chọn file Excel khác")
-    print(f"{Fore.CYAN}4.{Style.RESET_ALL} Cấu hình Debug Mode")
-    print(f"{Fore.CYAN}5.{Style.RESET_ALL} Thoát")
-    print(f"\n{Fore.MAGENTA}📁 File Excel hiện tại: {Fore.YELLOW}{os.path.basename(current_excel_file)}{Style.RESET_ALL}")
-    print(f"{Fore.GREEN}🧵 Hỗ trợ multi-threading để tăng tốc độ tạo ảnh{Style.RESET_ALL}")
-    
-    while True:
-        choice = input(f"\n{Fore.GREEN}Chọn chế độ (1/2/3/4/5): {Style.RESET_ALL}").strip()
-        if choice in ['1', '2', '3', '4', '5']:
-            return choice
-        else:
-            print(f"{Fore.RED}Lựa chọn không hợp lệ! Vui lòng chọn 1, 2, 3, 4 hoặc 5.{Style.RESET_ALL}")
-
-def main():
-    # Hiển thị ASCII art
-    text = r"""
-  __        ___     _     _       ____            _    _           
- \ \      / / |__ (_)___| | __  / ___|___   ___ | | _(_) ___  ___ 
-  \ \ /\ / /| '_ \| / __| |/ / | |   / _ \ / _ \| |/ / |/ _ \/ __|
-   \ V  V / | | | | \__ \   <  | |__| (_) | (_) |   <| |  __/\__ \
-    \_/\_/  |_| |_|_|___/_|\_\  \____\___/ \___/|_|\_\_|\___||___/
-"""
-    print(f"{Fore.YELLOW}{text}{Style.RESET_ALL}")
-    
-    # Kích hoạt browser simulation
-    activate_browser_simulation()
-    
-    # Hiển thị trạng thái debug mode
-    debug_status = "BẬT" if log_config.DEBUG else "TẮT"
-    print(f"\n{Fore.CYAN}🔧 Debug Mode: {Fore.YELLOW}{debug_status}{Style.RESET_ALL}")
-    if not log_config.DEBUG:
-        print(f"{Fore.GREEN}✓ Chế độ tối ưu: Chỉ hiển thị lỗi và thông tin quan trọng{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}  (Có thể bật debug trong menu để xem log chi tiết){Style.RESET_ALL}")
-    else:
-        print(f"{Fore.YELLOW}⚠ Chế độ debug: Sẽ hiển thị tất cả log chi tiết{Style.RESET_ALL}")
-    
-    # Hiển thị thông tin multi-threading
-    print(f"\n{Fore.GREEN}🧵 Multi-threading: {Fore.YELLOW}ĐÃ KÍCH HOẠT{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}✓ Hỗ trợ chạy nhiều luồng để tăng tốc độ tạo ảnh{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}✓ Thread-safe logging và progress tracking{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}✓ Khuyến nghị sử dụng 2-5 luồng cho hiệu suất tối ưu{Style.RESET_ALL}")
-    
-    # Đọc và thiết lập proxy
-    log_info("Đang đọc cấu hình proxy...")
-    proxy_config = read_proxy()
-    if proxy_config:
-        browser_sim.set_proxy(proxy_config)
-        # Test kết nối proxy
-        if not test_proxy_connection(proxy_config):
-            log_warning("Proxy không hoạt động tốt, có thể gây lỗi khi tạo ảnh")
-            choice = input("Bạn có muốn tiếp tục không? (y/n): ").strip().lower()
-            if choice not in ['y', 'yes']:
-                log_info("Thoát chương trình")
-                return
-    else:
-        log_info("Không sử dụng proxy")
-    
-    # Đọc config
-    with open('config.json', 'r', encoding='utf-8') as f:
-        config = json.load(f)
-    
-    seed = config.get('seed', 0)
-    global image_model
-    image_model = config.get('imageModel', 'IMAGEN_3_5')
-    
-    # Lấy access_token
-    log_info("Đang lấy access_token...")
-    cookie = read_cookie()
-    access_data = get_access_token(cookie)
-    
-    if not access_data or not access_data.get('access_token'):
-        log_error("Không thể lấy access_token. Dừng chương trình.")
-        return
-    
-    user_info = access_data.get('user', {})
-    log_success("Đã lấy access_token thành công!")
-    log_user_info(user_info.get('name', 'Unknown'), user_info.get('email', 'Unknown'))
-
-    access_token = access_data.get('access_token')
-    
-    # Biến lưu trữ file Excel được chọn
-    selected_excel_file = 'prompt_image.xlsx'  # File mặc định
-    
-    # Hiển thị menu chính
-    while True:
-        choice = show_main_menu(selected_excel_file)
-        
-        if choice == '1':
-            # Chế độ tạo ảnh từ prompt (Excel)
-            excel_mode(access_token, seed, selected_excel_file)
-        elif choice == '2':
-            # Chế độ tạo ảnh từ Excel + Ảnh
-            excel_img2img_mode(access_token, cookie, seed, selected_excel_file)
-        elif choice == '3':
-            # Chọn file Excel khác
-            new_file = select_excel_file()
-            if new_file:
-                selected_excel_file = new_file
-                print(f"{Fore.GREEN}✓ Đã chọn file Excel: {os.path.basename(selected_excel_file)}{Style.RESET_ALL}")
-        elif choice == '4':
-            # Cấu hình Debug Mode
-            toggle_debug_mode()
-        elif choice == '5':
-            # Thoát
-            log_info("Cảm ơn bạn đã sử dụng chương trình!")
-            break
-
-def excel_mode(access_token, seed, excel_file_path='prompt_image.xlsx'):
-    """Chế độ tạo ảnh từ Excel (chỉ prompt) với multi-threading"""
-    global current_seed
-    current_seed = seed  # Khởi tạo seed global
-    
-    # Lấy số luồng từ user
-    thread_count = get_thread_count()
-    
-    output_folder = get_output_folder()
-    if not create_folder_if_not_exists(output_folder):
-        log_error("Không thể tạo folder. Dừng chương trình.")
-        return
-    
-    excel_data = read_excel_data(excel_file_path)
-    if not excel_data:
-        log_error("Không có dữ liệu trong file Excel. Dừng chương trình.")
-        return
-    
-    log_success(f"Đã đọc {len(excel_data)} dòng dữ liệu từ Excel")
-    log_info(f"Bắt đầu tạo {len(excel_data)} ảnh với {thread_count} luồng...")
-    
-    # Tạo danh sách tasks
-    tasks = []
-    for stt, prompt in excel_data:
-        task_data = (stt, prompt, access_token, output_folder)
-        tasks.append(task_data)
-    
-    # Tạo progress bar
-    with tqdm(total=len(tasks), desc="Tạo ảnh", 
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-              colour='green') as pbar:
-        
-        # Sử dụng ThreadPoolExecutor để xử lý multi-threading
-        with ThreadPoolExecutor(max_workers=thread_count) as executor:
-            # Submit tất cả tasks
-            future_to_task = {executor.submit(process_single_image_task, task): task for task in tasks}
-            
-            # Xử lý kết quả khi hoàn thành
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                stt = task[0]
-                
-                try:
-                    result = future.result()
-                    if result:
-                        pbar.set_description(f"✅ Hoàn thành STT {stt}")
-                    else:
-                        pbar.set_description(f"❌ Lỗi STT {stt}")
-                except Exception as e:
-                    log_error(f"Lỗi thread cho STT {stt}: {e}")
-                    pbar.set_description(f"❌ Exception STT {stt}")
-                
-                pbar.update(1)
-    
-    log_success("Hoàn thành tạo ảnh từ Excel với multi-threading!")
-
-def excel_img2img_mode(access_token, cookie, seed, excel_file_path='prompt_image.xlsx'):
-    """Chế độ tạo ảnh từ Excel với Image-to-Image và multi-threading"""
-    global current_seed
-    current_seed = seed  # Khởi tạo seed global
-    
-    # Lấy số luồng từ user
-    thread_count = get_thread_count()
-    
-    output_folder = get_output_folder()
-    if not create_folder_if_not_exists(output_folder):
-        log_error("Không thể tạo folder. Dừng chương trình.")
-        return
-    
-    excel_data = read_excel_img2img_data(excel_file_path)
-    if not excel_data:
-        log_error("Không có dữ liệu trong file Excel. Dừng chương trình.")
-        return
-    
-    log_success(f"Đã đọc {len(excel_data)} dòng dữ liệu từ Excel")
-    log_info(f"Bắt đầu tạo {len(excel_data)} ảnh từ ảnh với {thread_count} luồng...")
-    
-    # Tạo danh sách tasks
-    tasks = []
-    for stt, prompt, image_path in excel_data:
-        task_data = (stt, prompt, image_path, access_token, cookie, output_folder)
-        tasks.append(task_data)
-    
-    # Tạo progress bar
-    with tqdm(total=len(tasks), desc="Tạo ảnh từ ảnh", 
-              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-              colour='magenta') as pbar:
-        
-        # Sử dụng ThreadPoolExecutor để xử lý multi-threading
-        with ThreadPoolExecutor(max_workers=thread_count) as executor:
-            # Submit tất cả tasks
-            future_to_task = {executor.submit(process_single_img2img_task, task): task for task in tasks}
-            
-            # Xử lý kết quả khi hoàn thành
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                stt = task[0]
-                
-                try:
-                    result = future.result()
-                    if result:
-                        pbar.set_description(f"✅ Hoàn thành STT {stt}")
-                    else:
-                        pbar.set_description(f"❌ Lỗi STT {stt}")
-                except Exception as e:
-                    log_error(f"Lỗi thread cho STT {stt}: {e}")
-                    pbar.set_description(f"❌ Exception STT {stt}")
-                
-                pbar.update(1)
-    
-    log_success("Hoàn thành tạo ảnh từ Excel Image-to-Image với multi-threading!")
 
 
 
 
-# === UTILITY FUNCTIONS ===
-def select_excel_file():
-    """Chọn file Excel - hỗ trợ kéo thả vào CMD hoặc nhập đường dẫn"""
-    print(f"\n{Fore.YELLOW}📁 Chọn file Excel:{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}1.{Style.RESET_ALL} Kéo thả file Excel vào cửa sổ này")
-    print(f"{Fore.CYAN}2.{Style.RESET_ALL} Nhập đường dẫn file Excel")
-    print(f"{Fore.CYAN}3.{Style.RESET_ALL} Sử dụng file dialog")
-    print(f"{Fore.CYAN}4.{Style.RESET_ALL} Hủy bỏ")
-    
-    while True:
-        choice = input(f"\n{Fore.GREEN}Chọn cách chọn file (1/2/3/4): {Style.RESET_ALL}").strip()
-        
-        if choice == '1':
-            # Kéo thả file vào CMD
-            print(f"\n{Fore.YELLOW}📂 Kéo thả file Excel vào cửa sổ này, sau đó nhấn Enter...{Style.RESET_ALL}")
-            file_path = input(f"{Fore.CYAN}Đường dẫn file: {Style.RESET_ALL}").strip()
-            
-            if file_path:
-                file_path = file_path.strip('"')
-                if os.path.exists(file_path) and file_path.lower().endswith(('.xlsx', '.xls')):
-                    return file_path
-                else:
-                    print(f"{Fore.RED}File không tồn tại hoặc không phải file Excel!{Style.RESET_ALL}")
-                    continue
-            else:
-                return None
-                
-        elif choice == '2':
-            # Nhập đường dẫn thủ công
-            file_path = input(f"\n{Fore.CYAN}Nhập đường dẫn file Excel: {Style.RESET_ALL}").strip()
-            file_path = file_path.strip('"')
-            
-            if file_path:
-                if os.path.exists(file_path) and file_path.lower().endswith(('.xlsx', '.xls')):
-                    return file_path
-                else:
-                    print(f"{Fore.RED}File không tồn tại hoặc không phải file Excel!{Style.RESET_ALL}")
-                    continue
-            else:
-                return None
-                
-        elif choice == '3':
-            # Sử dụng file dialog
-            try:
-                root = tk.Tk()
-                root.withdraw()
-                
-                file_path = filedialog.askopenfilename(
-                    title="Chọn file Excel",
-                    filetypes=[
-                        ("Excel files", "*.xlsx *.xls"),
-                        ("All files", "*.*")
-                    ],
-                    initialdir=os.getcwd()
-                )
-                
-                root.destroy()
-                return file_path if file_path else None
-                
-            except Exception as e:
-                print(f"{Fore.RED}Lỗi khi mở file dialog: {e}{Style.RESET_ALL}")
-                continue
-                
-        elif choice == '4':
-            return None
-            
-        else:
-            print(f"{Fore.RED}Lựa chọn không hợp lệ!{Style.RESET_ALL}")
-
-def ensure_dir(path):
-    """Ensure directory exists"""
-    if not os.path.exists(path):
-        os.makedirs(path)
-
-def center_line(text, width=70):
-    """Center text within given width"""
-    return text.center(width)
-
-def print_box(info):
-    """Print authentication info in a formatted box"""
-    box_width = 70
-    print("╔" + "═" * (box_width - 2) + "╗")
-    print("║" + center_line("🔐 XÁC THỰC KEY THÀNH CÔNG", box_width - 2) + "║")
-    print("╠" + "═" * (box_width - 2) + "╣")
-    print("║" + center_line(f"🔑 KEY       : {info.get('key')}", box_width - 2) + "║")
-    print("║" + center_line(f"📅 Hết hạn    : {info.get('expires')}", box_width - 2) + "║")
-    print("║" + center_line(f"🔁 Số lượt    : {info.get('remaining')}", box_width - 2) + "║")
-    print("╠" + "═" * (box_width - 2) + "╣")
-    print("║" + center_line("🧠 Info dev @huyit32", box_width - 2) + "║")
-    print("║" + center_line("📧 qhuy.dev@gmail.com", box_width - 2) + "║")
-    print("╚" + "═" * (box_width - 2) + "╝")
-
-
-if __name__ == "__main__":
-    API_AUTH = f"{API_URL}/api/make_video_ai/auth"
-    MAX_RETRIES = 5
-
-    print("\n📌 XÁC THỰC KEY ĐỂ SỬ DỤNG CÔNG CỤ - WHISK AI\n")
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        key = input(f"🔑 Nhập API Key (Lần {attempt}/{MAX_RETRIES}): ").strip()
-        success, message, info = check_key_online(key, API_AUTH)
-
-        if success:
-            print("\n" + message + "\n")
-            print_box(info)
-            print()
-
-            run_now = input("▶️  Bạn có muốn chạy chương trình ngay bây giờ không? (Y/n): ").strip().lower()
-            if run_now in ("", "y", "yes"):
-                print("🚀 Khởi động WHISK AI...")
-                main()  # Gọi hàm main() trực tiếp
-            else:
-                print("✋ Bạn đã chọn không chạy chương trình. Thoát.")
-            break
-        else:
-            print(f"\n {message}")
-            if attempt < MAX_RETRIES:
-                print("↩️  Vui lòng thử lại...\n")
-                time.sleep(1)
-            else:
-                print("\n🚫 Đã nhập sai quá 5 lần. Thoát chương trình.")
-                print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                print("🧠 Info dev @huyit32 | 📧 qhuy.dev@gmail.com")
-                print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                sys.exit(1)
