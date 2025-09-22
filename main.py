@@ -1,849 +1,1942 @@
-import requests
-import json
-import pandas as pd
-import uuid
-import base64
-import os
-from datetime import datetime
-from colorama import init, Fore, Style
-from tqdm import tqdm
-import threading
-import time
 import sys
-import random
-import string
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import tkinter as tk
-from tkinter import filedialog
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import queue
+import json
+import os
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, 
+                             QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, 
+                             QTableWidgetItem, QDialog, QTextEdit, QLabel, 
+                             QLineEdit, QFileDialog, QMessageBox, QProgressBar,
+                             QGroupBox, QGridLayout, QComboBox, QSpinBox,
+                             QTextBrowser, QSplitter, QCheckBox)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont
+from datetime import datetime
 
-from auth.auth_guard import check_key_online
-API_URL = "http://62.171.131.164:5000"
+from api import (get_access_token, generate_image, 
+                generate_image_from_multiple_images,
+                 upload_image_to_google_labs, save_base64_image, sanitize_filename)
+import api  # Import module để truy cập biến global
 
-# Khởi tạo colorama
-init(autoreset=True)
+class CookieDialog(QDialog):
+    """Dialog để thêm cookie mới"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Thêm Cookie")
+        self.setModal(True)
+        self.setFixedSize(600, 400)
+        
+        layout = QVBoxLayout()
+        
+        # Label hướng dẫn
+        instruction_label = QLabel("Nhập cookie từ Google Labs:")
+        instruction_label.setStyleSheet("font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(instruction_label)
+        
+        # Text area cho cookie
+        self.cookie_text = QTextEdit()
+        self.cookie_text.setPlaceholderText("Dán cookie từ trình duyệt vào đây...")
+        self.cookie_text.setMaximumHeight(200)
+        layout.addWidget(self.cookie_text)
+        
+        # Label tên tài khoản
+        name_label = QLabel("Tên tài khoản:")
+        layout.addWidget(name_label)
+        
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Nhập tên để dễ nhận biết...")
+        layout.addWidget(self.name_input)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        self.test_button = QPushButton("Kiểm tra Cookie")
+        self.test_button.clicked.connect(self.test_cookie)
+        button_layout.addWidget(self.test_button)
+        
+        self.add_button = QPushButton("Thêm")
+        self.add_button.clicked.connect(self.accept)
+        self.add_button.setEnabled(False)
+        button_layout.addWidget(self.add_button)
+        
+        cancel_button = QPushButton("Hủy")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
+        
+        # Status label
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: gray; font-style: italic;")
+        layout.addWidget(self.status_label)
+        
+        self.setLayout(layout)
+        
+        # Kết nối signal để enable/disable nút Add
+        self.cookie_text.textChanged.connect(self.on_text_changed)
+        self.name_input.textChanged.connect(self.on_text_changed)
+    
+    def on_text_changed(self):
+        """Enable nút Add khi có đủ thông tin"""
+        has_cookie = bool(self.cookie_text.toPlainText().strip())
+        has_name = bool(self.name_input.text().strip())
+        self.add_button.setEnabled(has_cookie and has_name)
+    
+    def test_cookie(self):
+        """Kiểm tra cookie có hợp lệ không"""
+        cookie = self.cookie_text.toPlainText().strip()
+        if not cookie:
+            self.status_label.setText("Vui lòng nhập cookie")
+            self.status_label.setStyleSheet("color: red;")
+            return
+        
+        self.status_label.setText("Đang kiểm tra cookie...")
+        self.status_label.setStyleSheet("color: blue;")
+        self.test_button.setEnabled(False)
+        
+        # Test cookie trong thread riêng
+        self.test_thread = CookieTestThread(cookie)
+        self.test_thread.result.connect(self.on_test_result)
+        self.test_thread.start()
+    
+    def on_test_result(self, success, message, user_info):
+        """Xử lý kết quả test cookie"""
+        self.test_button.setEnabled(True)
+        
+        if success:
+            self.status_label.setText(f"✅ Cookie hợp lệ - {message}")
+            self.status_label.setStyleSheet("color: green;")
+            # Tự động điền tên nếu chưa có
+            if not self.name_input.text().strip():
+                self.name_input.setText(user_info.get('name', ''))
+        else:
+            self.status_label.setText(f"❌ {message}")
+            self.status_label.setStyleSheet("color: red;")
+    
+    def get_cookie_data(self):
+        """Lấy dữ liệu cookie từ dialog"""
+        return {
+            'cookie': self.cookie_text.toPlainText().strip(),
+            'name': self.name_input.text().strip(),
+            'validated': True,
+            'user_info': {}
+        }
 
-# ===== LOGGING CONFIGURATION =====
-class LogConfig:
-    """Cấu hình logging - có thể bật/tắt các loại log"""
-    DEBUG = False  # Bật/tắt log debug chi tiết
-    INFO = True    # Bật/tắt log thông tin
-    SUCCESS = True # Bật/tắt log thành công
-    ERROR = True   # Bật/tắt log lỗi (luôn hiển thị)
-    WARNING = True # Bật/tắt log cảnh báo
+class CookieTestThread(QThread):
+    """Thread để test cookie"""
+    result = pyqtSignal(bool, str, dict)
+    
+    def __init__(self, cookie, account_name=None):
+        super().__init__()
+        self.cookie = cookie
+        self.account_name = account_name
+    
+    def run(self):
+        try:
+            # Lấy access token mới từ cookie
+            access_data = get_access_token(self.cookie)
+            if access_data and access_data.get('access_token'):
+                user_info = access_data.get('user', {})
+                name = user_info.get('name', 'Unknown')
+                email = user_info.get('email', 'Unknown')
+                
+                # Thêm thông tin access token vào user_info để có thể cập nhật
+                user_info['access_token'] = access_data.get('access_token')
+                user_info['last_checked'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                user_info['expires_at'] = access_data.get('expires_at', 'Unknown')
+                user_info['token_created_at'] = access_data.get('token_created_at', 'Unknown')
+                
+                self.result.emit(True, f"{name} ({email}) - Token mới đã được lấy", user_info)
+            else:
+                self.result.emit(False, "Cookie không hợp lệ hoặc đã hết hạn", {})
+        except Exception as e:
+            self.result.emit(False, f"Lỗi khi kiểm tra: {str(e)}", {})
 
-# Khởi tạo cấu hình log
-log_config = LogConfig()
-
-# Thread-safe variables
-log_lock = threading.Lock()
-progress_lock = threading.Lock()
-seed_lock = threading.Lock()
-current_seed = 0  # Global seed counter for multi-threading
-
-# ===== BROWSER SIMULATION SETTINGS =====
-class BrowserSimulator:
-    """Lớp giả lập trình duyệt thật"""
+class AccountManagementTab(QWidget):
+    """Tab quản lý tài khoản"""
+    
+    # Signal để thông báo khi có thay đổi tài khoản
+    account_updated = pyqtSignal()
     
     def __init__(self):
-        self.user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0 Safari/537.36"
-        ]
-        self.session = requests.Session()
-        self.proxy_config = None
-        self._setup_session()
+        super().__init__()
+        self.init_ui()
+        self.load_cookies()
     
-    def _setup_session(self):
-        """Thiết lập session với retry strategy"""
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-    
-    def set_proxy(self, proxy_config):
-        """Thiết lập proxy cho session"""
-        self.proxy_config = proxy_config
-        if proxy_config:
-            self.session.proxies.update(proxy_config)
-            log_success("Đã thiết lập proxy thành công")
-        else:
-            self.session.proxies.clear()
-            log_info("Đã xóa cấu hình proxy")
-    
-    def get_random_user_agent(self):
-        """Lấy User-Agent ngẫu nhiên"""
-        return random.choice(self.user_agents)
-    
-    def get_browser_headers(self):
-        """Tạo headers giả lập trình duyệt thật"""
-        user_agent = self.get_random_user_agent()
+    def init_ui(self):
+        layout = QVBoxLayout()
         
-        headers = {
-            "User-Agent": user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT": "1",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Cache-Control": "max-age=0",
-            "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"'
-        }
-        return headers
+        # Accounts Group Box
+        accounts_group = QGroupBox("Accounts")
+        accounts_layout = QVBoxLayout()
+        
+        # Header buttons
+        header_layout = QHBoxLayout()
+        header_layout.addStretch()
+        
+        # Buttons
+        self.add_button = QPushButton("Add Cookie")
+        self.add_button.clicked.connect(self.add_cookie)
+        self.add_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-family: "Open Sans";
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        header_layout.addWidget(self.add_button)
+        
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh_table)
+        self.refresh_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-family: "Open Sans";
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+        """)
+        header_layout.addWidget(self.refresh_button)
+        
+        accounts_layout.addLayout(header_layout)
+        
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["NAME", "EMAIL", "STATUS", "LAST CHECKED", "EXPIRES AT", "ACTION"])
+        
+        # Styling table
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: white;
+                border-radius: 3px;
+                gridline-color: #f0f0f0;
+                font-family: "Open Sans";
+                border: none;
+            }
+            QHeaderView::section {
+                background-color: #f8f9fa;
+                padding: 8px;
+                border: none;
+                border-right: 1px solid #f0f0f0;
+                border-bottom: 1px solid #e0e0e0;
+                font-weight: bold;
+                font-size: 12px;
+                font-family: "Open Sans";
+                color: #333;
+            }
+            QHeaderView::section:first {
+                border-left: none;
+            }
+            QHeaderView::section:last {
+                border-right: none;
+            }
+           
+        """)
+        
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setDefaultSectionSize(40)
+        # Căn giữa header
+        header = self.table.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignCenter)
+        
+        # Căn giữa nội dung các cột
+        self.table.setColumnWidth(0, 150)  # Tên
+        self.table.setColumnWidth(1, 200)  # Email  
+        self.table.setColumnWidth(2, 120)  # Trạng thái
+        self.table.setColumnWidth(3, 150)  # Kiểm tra lần cuối
+        self.table.setColumnWidth(4, 180)  # Thời gian hết hạn
+        # Cột Thao tác sẽ tự động stretch
+        
+        accounts_layout.addWidget(self.table)
+        accounts_group.setLayout(accounts_layout)
+        
+        layout.addWidget(accounts_group)
+        self.setLayout(layout)
     
-    def get_api_headers(self, access_token=None, cookie=None):
-        """Tạo headers cho API requests"""
-        headers = self.get_browser_headers()
-        headers.update({
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": "https://labs.google",
-            "Referer": "https://labs.google/"
-        })
-        
-        if access_token:
-            headers["Authorization"] = f"Bearer {access_token}"
-        if cookie:
-            headers["Cookie"] = cookie
-            
-        return headers
-    
-    def generate_fingerprint(self):
-        """Tạo fingerprint giả lập"""
-        fingerprint = {
-            "screen_resolution": random.choice(["1920x1080", "1366x768", "1440x900", "1536x864"]),
-            "timezone": random.choice(["Asia/Ho_Chi_Minh", "Asia/Bangkok", "Asia/Jakarta"]),
-            "language": "en-US",
-            "platform": "Win32",
-            "hardware_concurrency": random.choice([4, 8, 12, 16]),
-            "device_memory": random.choice([4, 8, 16, 32])
-        }
-        return fingerprint
-    
-    def random_delay(self, min_delay=1, max_delay=3):
-        """Delay ngẫu nhiên giữa các request"""
-        delay = random.uniform(min_delay, max_delay)
-        time.sleep(delay)
-        return delay
-    
-    def make_request(self, method, url, **kwargs):
-        """Thực hiện request với giả lập trình duyệt"""
-        # Thêm headers giả lập
-        if 'headers' not in kwargs:
-            kwargs['headers'] = {}
-        
-        # Merge với headers giả lập
-        browser_headers = self.get_browser_headers()
-        kwargs['headers'].update(browser_headers)
-        
-        # Thêm proxy nếu có
-        if self.proxy_config:
-            kwargs['proxies'] = self.proxy_config
-        
-        # Random delay trước request
-        delay = self.random_delay()
-        
+    def load_cookies(self):
+        """Load cookies từ file cookies.json"""
         try:
-            log_debug(f"🔍 make_request:")
-            log_debug(f"  - Method: {method}")
-            log_debug(f"  - URL: {url}")
-            log_debug(f"  - Headers: {kwargs.get('headers', {})}")
-            log_debug(f"  - Proxies: {kwargs.get('proxies', 'None')}")
-            log_debug(f"  - Timeout: {kwargs.get('timeout', 'None')}")
-            
-            response = self.session.request(method, url, **kwargs)
-            
-            log_debug(f"🔍 make_request response:")
-            log_debug(f"  - Status: {response.status_code if response else 'None'}")
-            log_debug(f"  - Response object: {type(response)}")
-            
-            # Kiểm tra response có hợp lệ không
-            if response is None:
-                log_error("Response là None - không có phản hồi từ server")
-                return None
-            
-            # Log thêm thông tin response
-            log_debug(f"  - Response headers: {dict(response.headers)}")
-            log_debug(f"  - Response text length: {len(response.text) if response.text else 0}")
-            
-            return response
-            
-        except requests.exceptions.ProxyError as e:
-            log_error(f"Lỗi proxy: {e}")
-            log_error("Kiểm tra lại cấu hình proxy trong proxy.txt")
-            return None
-        except requests.exceptions.Timeout as e:
-            log_error(f"Request timeout: {e}")
-            log_error("Thử tăng timeout hoặc kiểm tra kết nối mạng")
-            return None
-        except requests.exceptions.ConnectionError as e:
-            log_error(f"Lỗi kết nối: {e}")
-            log_error("Kiểm tra kết nối internet và proxy")
-            return None
-        except requests.exceptions.RequestException as e:
-            log_error(f"Lỗi request: {e}")
-            return None
-        except Exception as e:
-            log_error(f"Lỗi không xác định: {e}")
-            import traceback
-            log_error(f"Chi tiết lỗi: {traceback.format_exc()}")
-            return None
-
-# Khởi tạo browser simulator
-browser_sim = BrowserSimulator()
-
-def activate_browser_simulation():
-    """Kích hoạt các thông số giả lập trình duyệt thật"""
-    print("✓ Đã kích hoạt các thông số giả lập trình duyệt thật:")
-    print("  - User-Agent ngẫu nhiên")
-    print("  - Headers giả lập trình duyệt")
-    print("  - Fingerprint giả lập")
-    print("  - Retry strategy cho request")
-    print("  - Connection pooling")
-
-def log_debug(message):
-    """Log debug chi tiết - chỉ hiển thị khi DEBUG = True"""
-    if log_config.DEBUG:
-        with log_lock:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"{Fore.CYAN}[{timestamp}] {Fore.BLUE}[DEBUG]{Style.RESET_ALL} {message}")
-
-def log_info(message):
-    """Log thông tin với thời gian và màu xanh"""
-    if log_config.INFO:
-        with log_lock:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"{Fore.CYAN}[{timestamp}] {Fore.GREEN}[INFO]{Style.RESET_ALL} {message}")
-
-def log_success(message):
-    """Log thành công với thời gian và màu xanh lá"""
-    if log_config.SUCCESS:
-        with log_lock:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"{Fore.CYAN}[{timestamp}] {Fore.GREEN}[SUCCESS]{Style.RESET_ALL} {message}")
-
-def log_error(message):
-    """Log lỗi với thời gian và màu đỏ - luôn hiển thị"""
-    with log_lock:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"{Fore.CYAN}[{timestamp}] {Fore.RED}[ERROR]{Style.RESET_ALL} {message}")
-
-def log_warning(message):
-    """Log cảnh báo với thời gian và màu vàng"""
-    if log_config.WARNING:
-        with log_lock:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"{Fore.CYAN}[{timestamp}] {Fore.YELLOW}[WARNING]{Style.RESET_ALL} {message}")
-
-def log_user_info(name, email):
-    """Log thông tin user với màu đặc biệt"""
-    with log_lock:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"{Fore.CYAN}[{timestamp}] {Fore.MAGENTA}[USER]{Style.RESET_ALL} {Fore.BLUE}{name}{Style.RESET_ALL} <{Fore.CYAN}{email}{Style.RESET_ALL}>")
-
-class LoadingSpinner:
-    """Loading spinner với animation"""
-    def __init__(self, message="Loading...", color=Fore.YELLOW):
-        self.message = message
-        self.color = color
-        self.spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-        self.running = False
-        self.thread = None
-    
-    def start(self):
-        """Bắt đầu spinner"""
-        self.running = True
-        self.thread = threading.Thread(target=self._spin)
-        self.thread.daemon = True
-        self.thread.start()
-    
-    def stop(self):
-        """Dừng spinner"""
-        self.running = False
-        if self.thread:
-            self.thread.join()
-        # Xóa dòng hiện tại
-        sys.stdout.write('\r' + ' ' * (len(self.message) + 10) + '\r')
-        sys.stdout.flush()
-    
-    def _spin(self):
-        """Animation loop"""
-        i = 0
-        while self.running:
-            sys.stdout.write(f'\r{self.color}{self.spinner_chars[i % len(self.spinner_chars)]}{Style.RESET_ALL} {self.message}')
-            sys.stdout.flush()
-            time.sleep(0.1)
-            i += 1
-
-def show_loading(message, duration=2):
-    """Hiển thị loading với thời gian cố định"""
-    spinner = LoadingSpinner(message, Fore.CYAN)
-    spinner.start()
-    time.sleep(duration)
-    spinner.stop()
-
-def get_thread_count():
-    """Lấy số luồng từ user input"""
-    print(f"\n{Fore.YELLOW}🧵 Cấu hình số luồng:{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}Lưu ý:{Style.RESET_ALL} Số luồng cao hơn sẽ tạo ảnh nhanh hơn nhưng có thể gây quá tải server")
-    print(f"{Fore.CYAN}Khuyến nghị:{Style.RESET_ALL} 2-5 luồng cho hiệu suất tối ưu")
-    
-    while True:
-        try:
-            thread_input = input(f"\n{Fore.GREEN}Nhập số luồng (1-10, mặc định 3): {Style.RESET_ALL}").strip()
-            
-            if not thread_input:
-                return 3  # Mặc định 3 luồng
-            
-            thread_count = int(thread_input)
-            
-            if 1 <= thread_count <= 10:
-                log_success(f"Đã chọn {thread_count} luồng")
-                return thread_count
+            if os.path.exists('cookies.json'):
+                with open('cookies.json', 'r', encoding='utf-8') as f:
+                    self.cookies_data = json.load(f)
             else:
-                print(f"{Fore.RED}Số luồng phải từ 1 đến 10!{Style.RESET_ALL}")
-        except ValueError:
-            print(f"{Fore.RED}Vui lòng nhập số nguyên hợp lệ!{Style.RESET_ALL}")
-
-def get_output_folder():
-    """Lấy folder output từ user input"""
-    print(f"\n{Fore.YELLOW}📁 Chọn folder để lưu ảnh:{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}1.{Style.RESET_ALL} Sử dụng folder hiện tại (./)")
-    print(f"{Fore.CYAN}2.{Style.RESET_ALL} Tạo folder mới")
-    print(f"{Fore.CYAN}3.{Style.RESET_ALL} Nhập đường dẫn folder")
-    
-    while True:
-        choice = input(f"\n{Fore.GREEN}Chọn (1/2/3): {Style.RESET_ALL}").strip()
-        
-        if choice == "1":
-            return "./"
-        elif choice == "2":
-            folder_name = input(f"{Fore.GREEN}Nhập tên folder mới: {Style.RESET_ALL}").strip()
-            if not folder_name:
-                folder_name = f"images_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            return folder_name
-        elif choice == "3":
-            folder_path = input(f"{Fore.GREEN}Nhập đường dẫn folder: {Style.RESET_ALL}").strip()
-            return folder_path
-        else:
-            print(f"{Fore.RED}Lựa chọn không hợp lệ! Vui lòng chọn 1, 2 hoặc 3.{Style.RESET_ALL}")
-
-def create_folder_if_not_exists(folder_path):
-    """Tạo folder nếu chưa tồn tại"""
-    if not os.path.exists(folder_path):
-        try:
-            os.makedirs(folder_path, exist_ok=True)
-            log_success(f"Đã tạo folder: {folder_path}")
-            return True
+                self.cookies_data = {}
+            
+            self.refresh_table()
         except Exception as e:
-            log_error(f"Không thể tạo folder {folder_path}: {e}")
-            return False
-    else:
-        log_info(f"Folder đã tồn tại: {folder_path}")
-        return True
-
-def read_cookie():
-    """Đọc cookie từ file cookie.txt"""
-    with open('cookie.txt', 'r', encoding='utf-8') as f:
-        return f.read().strip()
-
-def read_proxy():
-    """Đọc proxy từ file proxy.txt"""
-    try:
-        with open('proxy.txt', 'r', encoding='utf-8') as f:
-            proxy_line = f.read().strip()
-            if not proxy_line:
-                return None
+            QMessageBox.warning(self, "Lỗi", f"Không thể load cookies: {str(e)}")
+            self.cookies_data = {}
+    
+    def refresh_table(self):
+        """Làm mới bảng hiển thị"""
+        self.table.setRowCount(len(self.cookies_data))
+        
+        for row, (account_name, data) in enumerate(self.cookies_data.items()):
+            # Tên tài khoản
+            name_item = QTableWidgetItem(account_name)
+            name_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 0, name_item)
             
-            # Format: ip:port:username:password
-            parts = proxy_line.split(':')
-            if len(parts) == 4:
-                ip, port, username, password = parts
-                proxy_url = f"http://{username}:{password}@{ip}:{port}"
-                return {
-                    'http': proxy_url,
-                    'https': proxy_url
-                }
+            # Email
+            email = data.get('user_info', {}).get('email', 'N/A')
+            email_item = QTableWidgetItem(email)
+            email_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 1, email_item)
+            
+            # Trạng thái
+            status = "✅ Hợp lệ" if data.get('validated', False) else "❌ Lỗi"
+            status_item = QTableWidgetItem(status)
+            status_item.setTextAlignment(Qt.AlignCenter)
+            if data.get('validated', False):
+                status_item.setForeground(Qt.darkGreen)
+                status_item.setFont(QFont("Roboto", 10, QFont.Bold))
             else:
-                log_error("Format proxy không đúng. Cần: ip:port:username:password")
-                return None
-    except FileNotFoundError:
-        log_warning("Không tìm thấy file proxy.txt")
-        return None
-    except Exception as e:
-        log_error(f"Lỗi khi đọc proxy: {e}")
-        return None
-
-def test_proxy_connection(proxy_config):
-    """Test kết nối proxy"""
-    if not proxy_config:
-        log_info("Không có proxy để test")
-        return True
-    
-    log_info("🔍 Đang test kết nối proxy...")
-    test_urls = [
-        "http://httpbin.org/ip",
-        "https://httpbin.org/ip",
-        "https://www.google.com"
-    ]
-    
-    for url in test_urls:
-        try:
-            log_info(f"  - Test URL: {url}")
-            response = requests.get(url, proxies=proxy_config, timeout=10)
-            if response.status_code == 200:
-                log_success(f"  ✓ Proxy hoạt động với {url}")
-                if "httpbin.org" in url:
-                    log_info(f"    IP hiện tại: {response.json().get('origin', 'Unknown')}")
-                return True
-            else:
-                log_warning(f"  ⚠ Proxy trả về status {response.status_code} với {url}")
-        except requests.exceptions.ProxyError as e:
-            log_error(f"  ✗ Lỗi proxy với {url}: {e}")
-        except requests.exceptions.Timeout as e:
-            log_error(f"  ✗ Timeout với {url}: {e}")
-        except Exception as e:
-            log_error(f"  ✗ Lỗi khác với {url}: {e}")
-    
-    log_error("Proxy không hoạt động với bất kỳ URL nào")
-    return False
-
-def get_access_token(cookie):
-    """Lấy access_token từ Google Labs API"""
-    url = "https://labs.google/fx/api/auth/session"
-    headers = browser_sim.get_api_headers(cookie=cookie)
-    
-    # Hiển thị loading spinner
-    spinner = LoadingSpinner("Đang xác thực với Google Labs...", Fore.CYAN)
-    spinner.start()
-    
-    try:
-        response = browser_sim.make_request("GET", url, headers=headers, timeout=30)
-        spinner.stop()
-        
-        if response and response.status_code == 200:
-            return response.json()
-        else:
-            if response:
-                log_error(f"Lỗi khi lấy access_token: {response.status_code}")
-                log_error(response.text)
-            return None
-    except requests.exceptions.Timeout:
-        spinner.stop()
-        log_error("Timeout khi kết nối đến Google Labs")
-        return None
-    except Exception as e:
-        spinner.stop()
-        log_error(f"Lỗi kết nối: {e}")
-        return None
-
-def read_excel_data(excel_file_path='prompt_image.xlsx'):
-    """Đọc dữ liệu từ file Excel (STT, PROMPT)"""
-    try:
-        df = pd.read_excel(excel_file_path)
-        stt_list = df.iloc[:, 0].tolist()  # Cột A
-        prompt_list = df.iloc[:, 1].tolist()  # Cột B
-        return list(zip(stt_list, prompt_list))
-    except Exception as e:
-        log_error(f"Lỗi khi đọc file Excel: {e}")
-        return []
-
-def read_excel_img2img_data(excel_file_path='prompt_image.xlsx'):
-    """Đọc dữ liệu từ file Excel cho Image-to-Image (STT, PROMPT, IMAGE_PATH)"""
-    try:
-        df = pd.read_excel(excel_file_path)
-        stt_list = df.iloc[:, 0].tolist()  # Cột A
-        prompt_list = df.iloc[:, 1].tolist()  # Cột B
-        image_path_list = df.iloc[:, 2].tolist()  # Cột C
-        return list(zip(stt_list, prompt_list, image_path_list))
-    except Exception as e:
-        log_error(f"Lỗi khi đọc file Excel: {e}")
-        return []
-
-def generate_image(access_token, prompt, seed, aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE", max_retries=3):
-    """Gọi API để tạo ảnh với cơ chế retry"""
-    url = "https://aisandbox-pa.googleapis.com/v1/whisk:generateImage"
-    
-    headers = browser_sim.get_api_headers(access_token=access_token)
-    
-    # Các thông số cố định
-    image_model = "IMAGEN_3_5"
-    
-    for attempt in range(max_retries):
-        # Tạo UUID ngẫu nhiên cho workflowId mỗi lần retry
-        workflow_id = str(uuid.uuid4())
-        
-        payload = {
-            "clientContext": {
-                "workflowId": workflow_id,
-                "tool": "BACKBONE",
-                "sessionId": f";{uuid.uuid4().int}"
-            },
-            "imageModelSettings": {
-                "imageModel": image_model,
-                "aspectRatio": aspect_ratio
-            },
-            "seed": seed,
-            "prompt": prompt,
-            "mediaCategory": "MEDIA_CATEGORY_BOARD"
-        }
-        
-        # Hiển thị loading spinner
-        if attempt == 0:
-            spinner = LoadingSpinner("Đang tạo ảnh với AI...", Fore.MAGENTA)
-        else:
-            spinner = LoadingSpinner(f"Đang tạo ảnh với AI... (Thử lại lần {attempt + 1})", Fore.MAGENTA)
-        spinner.start()
-        
-        try:
-            if attempt > 0:
-                log_info(f"🔄 Thử lại lần {attempt + 1}/{max_retries}")
-                # Delay trước khi retry
-                time.sleep(2 * attempt)
+                status_item.setForeground(Qt.darkRed)
+                status_item.setFont(QFont("Roboto", 10, QFont.Bold))
+            self.table.setItem(row, 2, status_item)
             
-            log_debug(f"🔍 Đang gọi API generate_image:")
-            log_debug(f"  - URL: {url}")
-            log_debug(f"  - Payload: {json.dumps(payload, indent=2)}")
+            # Kiểm tra lần cuối
+            last_checked = data.get('user_info', {}).get('last_checked', 'Chưa kiểm tra')
+            last_checked_item = QTableWidgetItem(last_checked)
+            last_checked_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 3, last_checked_item)
             
-            response = browser_sim.make_request("POST", url, headers=headers, json=payload, timeout=60)
-            spinner.stop()
+            # Thời gian hết hạn
+            expires_at = data.get('user_info', {}).get('expires_at', 'Unknown')
+            expires_item = QTableWidgetItem(expires_at)
+            expires_item.setTextAlignment(Qt.AlignCenter)
             
-            if response is None:
-                log_error("API trả về None - không có kết quả")
-                if attempt < max_retries - 1:
-                    log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
-                    continue
-                else:
-                    log_error("Có thể do:")
-                    log_error("  - Proxy không hoạt động")
-                    log_error("  - Kết nối mạng bị lỗi")
-                    log_error("  - Server Google Labs không phản hồi")
-                    log_error("  - Access token hết hạn")
-                    return None
-            
-            log_debug(f"🔍 API response:")
-            log_debug(f"  - Status code: {response.status_code}")
-            log_debug(f"  - Headers: {dict(response.headers)}")
-            log_debug(f"  - Response text: {response.text[:500]}...")  # Chỉ in 500 ký tự đầu
-            
-            if response.status_code == 200:
+            # Kiểm tra xem token có hết hạn không
+            if expires_at in ['Parse Error', 'No Expires Info']:
+                # Token có vấn đề
+                expires_item.setForeground(Qt.darkRed)
+                expires_item.setText(f"{expires_at} (LỖI TOKEN)")
+            elif expires_at != 'Unknown':
                 try:
-                    result = response.json()
-                    log_debug(f"🔍 JSON response:")
-                    log_debug(f"  - Response keys: {list(result.keys()) if result else 'None'}")
-                    if 'imagePanels' in result:
-                        log_debug(f"  - imagePanels count: {len(result['imagePanels'])}")
-                        for i, panel in enumerate(result['imagePanels']):
-                            log_debug(f"    Panel {i} keys: {list(panel.keys())}")
-                            if 'generatedImages' in panel:
-                                log_debug(f"    Panel {i} generatedImages count: {len(panel['generatedImages'])}")
-                                for j, img in enumerate(panel['generatedImages']):
-                                    log_debug(f"      Image {j} keys: {list(img.keys())}")
-                    return result
-                except Exception as json_error:
-                    log_error(f"Lỗi parse JSON: {json_error}")
-                    log_error(f"Response text gốc: {response.text}")
-                    if attempt < max_retries - 1:
-                        log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
-                        continue
-                    return None
-            elif response.status_code == 401:
-                log_error("Lỗi xác thực (401) - Access token có thể đã hết hạn")
-                log_error("Vui lòng cập nhật cookie.txt")
-                return None
-            elif response.status_code == 403:
-                log_error("Lỗi quyền truy cập (403) - Có thể bị chặn bởi Google")
-                if attempt < max_retries - 1:
-                    log_warning("Thử đổi proxy hoặc User-Agent và thử lại...")
-                    continue
+                    from datetime import datetime
+                    expiry_time = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+                    current_time = datetime.now()
+                    
+                    if current_time > expiry_time:
+                        # Token đã hết hạn
+                        expires_item.setForeground(Qt.darkRed)
+                        expires_item.setText(f"{expires_at} (HẾT HẠN)")
+                    else:
+                        # Token còn hợp lệ
+                        expires_item.setForeground(Qt.darkGreen)
+                        expires_item.setText(f"{expires_at} (HỢP LỆ)")
+                except:
+                    expires_item.setForeground(Qt.darkRed)
+                    expires_item.setText(f"{expires_at} (LỖI PARSE)")
+            
+            self.table.setItem(row, 4, expires_item)
+            
+            # Thao tác
+            action_widget = QWidget()
+            action_layout = QHBoxLayout()
+            action_layout.setContentsMargins(5, 2, 5, 2)
+            action_layout.setAlignment(Qt.AlignCenter)
+            
+            test_btn = QPushButton("Checker")
+            test_btn.setMaximumWidth(70)
+            test_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #FF9800;
+                    color: white;
+                    border: none;
+                    padding: 4px 8px;
+                    border-radius: 3px;
+                    font-weight: bold;
+                    font-family: "Open Sans";
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #F57C00;
+                }
+            """)
+            test_btn.clicked.connect(lambda checked, name=account_name: self.test_account(name))
+            action_layout.addWidget(test_btn)
+            
+            delete_btn = QPushButton("Delete")
+            delete_btn.setMaximumWidth(60)
+            delete_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #f44336;
+                    color: white;
+                    border: none;
+                    padding: 4px 8px;
+                    border-radius: 3px;
+                    font-weight: bold;
+                    font-family: "Open Sans";
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #d32f2f;
+                }
+            """)
+            delete_btn.clicked.connect(lambda checked, name=account_name: self.delete_account(name))
+            action_layout.addWidget(delete_btn)
+            
+            action_widget.setLayout(action_layout)
+            self.table.setCellWidget(row, 5, action_widget)
+    
+    def add_cookie(self):
+        """Hiển thị dialog thêm cookie"""
+        dialog = CookieDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            cookie_data = dialog.get_cookie_data()
+            account_name = cookie_data['name']
+            
+            # Test cookie một lần nữa để lấy user_info
+            try:
+                access_data = get_access_token(cookie_data['cookie'])
+                if access_data and access_data.get('access_token'):
+                    user_info = access_data.get('user', {})
+                    user_info['access_token'] = access_data.get('access_token')
+                    user_info['last_checked'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    user_info['expires_at'] = access_data.get('expires_at', 'Unknown')
+                    user_info['token_created_at'] = access_data.get('token_created_at', 'Unknown')
+                    cookie_data['user_info'] = user_info
+                    cookie_data['validated'] = True
+                    
+                    # Lưu vào cookies.json
+                    self.cookies_data[account_name] = cookie_data
+                    self.save_cookies()
+                    self.refresh_table()
+                    
+                    # Thông báo có thay đổi tài khoản
+                    self.account_updated.emit()
+                    
+                    QMessageBox.information(self, "Thành công", f"Đã thêm tài khoản {account_name}")
                 else:
-                    log_error("Thử đổi proxy hoặc User-Agent")
-                    return None
-            elif response.status_code == 429:
-                log_error("Quá nhiều request (429) - Bị rate limit")
-                if attempt < max_retries - 1:
-                    wait_time = 5 * (attempt + 1)
-                    log_warning(f"Chờ {wait_time} giây rồi thử lại...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    log_error("Chờ một lúc rồi thử lại")
-                    return None
-            elif response.status_code >= 500:
-                log_error(f"Lỗi server (5xx): {response.status_code}")
-                if attempt < max_retries - 1:
-                    log_warning("Server Google Labs có thể đang gặp sự cố, thử lại...")
-                    continue
-                else:
-                    log_error("Server Google Labs có thể đang gặp sự cố")
-                    return None
+                    QMessageBox.warning(self, "Lỗi", "Cookie không hợp lệ")
+            except Exception as e:
+                QMessageBox.warning(self, "Lỗi", f"Không thể xác thực cookie: {str(e)}")
+    
+    def test_account(self, account_name):
+        """Test lại tài khoản và cập nhật thông tin"""
+        if account_name not in self.cookies_data:
+            return
+        
+        cookie = self.cookies_data[account_name]['cookie']
+        
+        # Test trong thread với thông tin tài khoản
+        self.test_thread = CookieTestThread(cookie, account_name)
+        self.test_thread.result.connect(lambda success, msg, info: self.on_test_complete(account_name, success, msg, info))
+        self.test_thread.start()
+    
+    def on_test_complete(self, account_name, success, message, user_info):
+        """Xử lý kết quả test và cập nhật thông tin tài khoản"""
+        if account_name in self.cookies_data:
+            self.cookies_data[account_name]['validated'] = success
+            
+            if success:
+                # Cập nhật thông tin user và access token mới
+                self.cookies_data[account_name]['user_info'] = user_info
+                
+                # Lưu thông tin cập nhật vào file
+                self.save_cookies()
+                self.refresh_table()
+                
+                # Thông báo có thay đổi tài khoản
+                self.account_updated.emit()
+                
+                # Hiển thị thông báo thành công với thông tin chi tiết
+                last_checked = user_info.get('last_checked', 'Unknown')
+                expires_at = user_info.get('expires_at', 'Unknown')
+                token_created = user_info.get('token_created_at', 'Unknown')
+                
+                # Kiểm tra xem token có hợp lệ không
+                try:
+                    from datetime import datetime
+                    expires_at = user_info.get('expires_at', 'Unknown')
+                    
+                    # Kiểm tra các trường hợp đặc biệt
+                    if expires_at in ['Parse Error', 'No Expires Info']:
+                        # Token có vấn đề, cần lấy cookie mới
+                        QMessageBox.warning(
+                            self, "Lỗi Token", 
+                            f"❌ Token có vấn đề!\n\n"
+                            f"Thông tin tài khoản:\n"
+                            f"- Tên: {user_info.get('name', 'Unknown')}\n"
+                            f"- Email: {user_info.get('email', 'Unknown')}\n"
+                            f"- Lỗi: {expires_at}\n\n"
+                            f"🔧 Hành động bắt buộc:\n"
+                            f"1. Vào Google Labs và đăng nhập lại\n"
+                            f"2. Copy cookie mới từ trình duyệt\n"
+                            f"3. Thêm cookie mới vào ứng dụng"
+                        )
+                    else:
+                        # Parse thời gian hết hạn
+                        expiry_time = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+                        current_time = datetime.now()
+                        
+                        if current_time > expiry_time:
+                            # Token đã hết hạn
+                            QMessageBox.warning(
+                                self, "Token hết hạn", 
+                                f"⚠️ Token đã hết hạn!\n\n"
+                                f"Thông tin tài khoản:\n"
+                                f"- Tên: {user_info.get('name', 'Unknown')}\n"
+                                f"- Email: {user_info.get('email', 'Unknown')}\n"
+                                f"- Token hết hạn: {expires_at}\n\n"
+                                f"🔧 Hành động bắt buộc:\n"
+                                f"1. Vào Google Labs và đăng nhập lại\n"
+                                f"2. Copy cookie mới từ trình duyệt\n"
+                                f"3. Thêm cookie mới vào ứng dụng"
+                            )
+                        else:
+                            # Token còn hợp lệ
+                            QMessageBox.information(
+                                self, "Kết quả Kiểm tra", 
+                                f"✅ {message}\n\n"
+                                f"Thông tin cập nhật:\n"
+                                f"- Tên: {user_info.get('name', 'Unknown')}\n"
+                                f"- Email: {user_info.get('email', 'Unknown')}\n"
+                                f"- Kiểm tra lần cuối: {last_checked}\n"
+                                f"- Token tạo lúc: {token_created}\n"
+                                f"- Token hết hạn: {expires_at}\n"
+                                f"- Access token đã được làm mới"
+                            )
+                except:
+                    # Nếu không parse được thời gian, hiển thị thông báo bình thường
+                    QMessageBox.information(
+                        self, "Kết quả Kiểm tra", 
+                        f"✅ {message}\n\n"
+                        f"Thông tin cập nhật:\n"
+                        f"- Tên: {user_info.get('name', 'Unknown')}\n"
+                        f"- Email: {user_info.get('email', 'Unknown')}\n"
+                        f"- Kiểm tra lần cuối: {last_checked}\n"
+                        f"- Token tạo lúc: {token_created}\n"
+                        f"- Token hết hạn: {expires_at}\n"
+                        f"- Access token đã được làm mới"
+                    )
             else:
-                log_error(f"Lỗi HTTP không xác định: {response.status_code}")
-                log_error(f"Response text: {response.text}")
-                if attempt < max_retries - 1:
-                    log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
-                    continue
-                return None
-        except requests.exceptions.Timeout:
-            spinner.stop()
-            log_error("Timeout khi tạo ảnh - có thể prompt quá phức tạp")
-            if attempt < max_retries - 1:
-                log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
-                continue
-            return None
+                # Cập nhật trạng thái lỗi
+                self.cookies_data[account_name]['validated'] = False
+                self.save_cookies()
+                self.refresh_table()
+                
+                QMessageBox.warning(
+                    self, "Kết quả Kiểm tra", 
+                    f"❌ {message}\n\n"
+                    f"Hướng dẫn khắc phục:\n"
+                    f"1. Vào Google Labs và đăng nhập lại\n"
+                    f"2. Copy cookie mới từ trình duyệt\n"
+                    f"3. Thêm cookie mới vào ứng dụng"
+                )
+    
+    def delete_account(self, account_name):
+        """Xóa tài khoản"""
+        reply = QMessageBox.question(self, "Xác nhận", 
+                                   f"Bạn có chắc muốn xóa tài khoản '{account_name}'?",
+                                   QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            if account_name in self.cookies_data:
+                del self.cookies_data[account_name]
+                self.save_cookies()
+                self.refresh_table()
+                QMessageBox.information(self, "Thành công", f"Đã xóa tài khoản {account_name}")
+    
+    def save_cookies(self):
+        """Lưu cookies vào file"""
+        try:
+            with open('cookies.json', 'w', encoding='utf-8') as f:
+                json.dump(self.cookies_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            spinner.stop()
-            log_error(f"Lỗi khi tạo ảnh: {e}")
-            if attempt < max_retries - 1:
-                log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
-                continue
-            return None
-    
-    log_error(f"Đã thử {max_retries} lần nhưng vẫn thất bại")
-    return None
+            QMessageBox.warning(self, "Lỗi", f"Không thể lưu cookies: {str(e)}")
 
-def download_image(image_url, filename):
-    """Tải xuống ảnh"""
-    try:
-        # Sử dụng proxy nếu có
-        proxies = browser_sim.proxy_config if browser_sim.proxy_config else None
-        response = requests.get(image_url, proxies=proxies)
-        if response.status_code == 200:
-            with open(filename, 'wb') as f:
-                f.write(response.content)
-            log_success(f"Đã tải xuống: {filename}")
-            return True
-    except Exception as e:
-        log_error(f"Lỗi khi tải xuống ảnh {filename}: {e}")
-    return False
-
-def save_base64_image(base64_data, filename, output_folder="./"):
-    """Lưu ảnh từ base64 vào folder được chỉ định"""
-    full_path = os.path.join(output_folder, filename)
+class ImageGenerationTab(QWidget):
+    """Tab tạo ảnh"""
     
-    try:
-        # Loại bỏ prefix data:image/jpeg;base64, nếu có
-        if ',' in base64_data:
-            base64_data = base64_data.split(',')[1]
+    def __init__(self):
+        super().__init__()
+        # Khởi tạo các biến
+        self.selected_excel_path = None
+        self.selected_subject_path = None
+        self.selected_scene_path = None
+        self.selected_style_path = None
+        self.output_folder_path = None
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
         
-        image_data = base64.b64decode(base64_data)
+        # Generation Image Group Box
+        generation_group = QGroupBox("Generation Image")
+        generation_layout = QVBoxLayout()
         
-        with open(full_path, 'wb') as f:
-            f.write(image_data)
+        # Splitter để chia 2 phần
+        splitter = QSplitter(Qt.Horizontal)
         
-        return True
-    except Exception as e:
-        log_error(f"Lỗi khi lưu ảnh {full_path}: {e}")
-        return False
-
-def upload_image_to_google_labs(cookie, image_path, caption="A hyperrealistic digital illustration depicts a shiny, chrome-like mouse character, standing confidently in a martial arts gi against a subtly rendered, dark background of what appears to be an arena. The character, positioned centrally in the frame, faces forward with a slight tilt of its head to the right. Its body is composed of a highly reflective, polished silver material, giving it a metallic, almost liquid sheen.\n\nThe mouse has large, round ears that match its reflective silver body. Its face is characterized by large, expressive eyes with black pupils surrounded by a thin white iris, and a faint, thin black eyebrow line above each eye. A small, dark triangular nose sits above a tiny, closed mouth. Whiskers, depicted as thin black lines, extend from its cheeks. The overall expression of the mouse is one of determination or seriousness.\n\nIt wears a dark, possibly black or very dark gray, martial arts gi. The gi consists of a wrap-around top with a V-neck opening and wide sleeves, secured at the waist by a tied belt with a knot at the front. The fabric of the gi has visible texture, with distinct lines and shading suggesting folds and creases, giving it a somewhat sketch-like or illustrated appearance in contrast to the smooth, reflective quality of the mouse's skin. The gi extends down to just above its feet. The mouse's feet are clad in simple, low-top white sneakers with dark soles, contrasting with the dark gi.\n\nThe background is dark and desaturated, creating a stark contrast with the shiny character. It suggests the interior of an arena or training dojo, with a circular, slightly elevated platform visible in the foreground where the mouse stands. The background features blurred architectural elements, possibly seating or walls, rendered in shades of dark gray and black. A faint \"SU\" logo, stylized in white, is visible in the upper right corner of the image. The lighting appears to come from the front and slightly above, accentuating the metallic sheen of the mouse and casting subtle shadows."):
-    """Upload ảnh lên Google Labs API"""
-    url = "https://labs.google/fx/api/trpc/backbone.uploadImage"
-    
-    headers = browser_sim.get_api_headers(cookie=cookie)
-    
-    # Đọc ảnh và chuyển thành base64
-    try:
-        with open(image_path, 'rb') as image_file:
-            image_data = base64.b64encode(image_file.read()).decode('utf-8')
-            # Thêm prefix data:image/jpeg;base64,
-            base64_string = f"data:image/jpeg;base64,{image_data}"
-    except Exception as e:
-        log_error(f"Lỗi khi đọc file ảnh {image_path}: {e}")
-        return None
-    
-    # Tạo UUID cho workflowId và sessionId
-    workflow_id = str(uuid.uuid4())
-    session_id = f";{uuid.uuid4().int}"
-    
-    payload = {
-        "json": {
-            "clientContext": {
-                "workflowId": workflow_id,
-                "sessionId": session_id
-            },
-            "uploadMediaInput": {
-                "mediaCategory": "MEDIA_CATEGORY_SUBJECT",
-                "rawBytes": base64_string,
-                "caption": caption
+        # Panel trái - Controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout()
+        left_layout.setContentsMargins(5, 5, 5, 5)
+        left_layout.setSpacing(10)
+        
+        # Chọn tài khoản
+        account_group = QGroupBox("Chọn Tài khoản")
+        account_layout = QVBoxLayout()
+        
+        self.account_combo = QComboBox()
+        self.load_accounts()
+        account_layout.addWidget(self.account_combo)
+        
+        account_group.setLayout(account_layout)
+        left_layout.addWidget(account_group)
+        
+        # Chọn chế độ
+        mode_group = QGroupBox("Chế độ Tạo Ảnh")
+        mode_layout = QVBoxLayout()
+        
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Prompt to Image", "Image to Image", "Import Excel"])
+        self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
+        mode_layout.addWidget(self.mode_combo)
+        
+        mode_group.setLayout(mode_layout)
+        left_layout.addWidget(mode_group)
+        
+        # Prompt (chỉ hiện khi không phải Excel mode)
+        self.prompt_group = QGroupBox("Prompt")
+        prompt_layout = QVBoxLayout()
+        
+        self.prompt_text = QTextEdit()
+        self.prompt_text.setPlaceholderText("Nhập mô tả ảnh bạn muốn tạo...")
+        prompt_layout.addWidget(self.prompt_text)
+        
+        self.prompt_group.setLayout(prompt_layout)
+        left_layout.addWidget(self.prompt_group, 1)  # Stretch factor = 1
+        
+        # Excel file selection (chỉ hiện khi Excel mode)
+        self.excel_group = QGroupBox("File Excel")
+        excel_layout = QVBoxLayout()
+        
+        self.excel_path_label = QLabel("Chưa chọn file Excel")
+        self.excel_path_label.setStyleSheet("color: gray; font-style: italic;")
+        excel_layout.addWidget(self.excel_path_label)
+        
+        self.select_excel_btn = QPushButton("Chọn File Excel")
+        self.select_excel_btn.clicked.connect(self.select_excel_file)
+        excel_layout.addWidget(self.select_excel_btn)
+        
+        # Preview Excel data
+        self.excel_preview_label = QLabel("")
+        self.excel_preview_label.setStyleSheet("color: blue; font-size: 12px;")
+        self.excel_preview_label.setWordWrap(True)
+        excel_layout.addWidget(self.excel_preview_label)
+        
+        # Excel data table
+        self.excel_table = QTableWidget()
+        self.excel_table.setColumnCount(8)
+        self.excel_table.setHorizontalHeaderLabels(["STT", "PROMPT", "SUBJECT", "SUBJECT_CAPTION", "SCENE", "SCENE_CAPTION", "STYLE", "STYLE_CAPTION"])
+        self.excel_table.setStyleSheet("""
+            QTableWidget {
+                background-color: white;
+                border-radius: 3px;
+                gridline-color: #f0f0f0;
+                font-family: "Open Sans";
+                border: none;
             }
-        }
-    }
-    
-    # Hiển thị loading spinner
-    spinner = LoadingSpinner("Đang upload ảnh lên Google Labs...", Fore.CYAN)
-    spinner.start()
-    
-    try:
-        response = browser_sim.make_request("POST", url, headers=headers, json=payload, timeout=60)
-        spinner.stop()
+            QHeaderView::section {
+                background-color: #f8f9fa;
+                padding: 8px;
+                border: none;
+                border-right: 1px solid #f0f0f0;
+                border-bottom: 1px solid #e0e0e0;
+                font-weight: bold;
+                font-size: 12px;
+                font-family: "Open Sans";
+                color: #333;
+            }
+            QHeaderView::section:first {
+                border-left: none;
+            }
+            QHeaderView::section:last {
+                border-right: none;
+            }
+        """)
+        self.excel_table.setAlternatingRowColors(True)
+        self.excel_table.horizontalHeader().setStretchLastSection(True)
+        self.excel_table.verticalHeader().setDefaultSectionSize(35)
         
-        if response and response.status_code == 200:
-            result = response.json()
-            if 'result' in result and 'data' in result['result']:
-                upload_data = result['result']['data']['json']['result']
-                log_success("Upload ảnh thành công!")
-                return {
-                    'caption': caption,
-                    'uploadMediaGenerationId': upload_data['uploadMediaGenerationId'],
-                    'workflowId': workflow_id,
-                    'sessionId': session_id
-                }
+        # Căn giữa header
+        header = self.excel_table.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignCenter)
+        
+        excel_layout.addWidget(self.excel_table)
+        
+        self.excel_group.setLayout(excel_layout)
+        left_layout.addWidget(self.excel_group, 2)  # Stretch factor = 2 (lớn nhất)
+        self.excel_group.setVisible(False)  # Ẩn ban đầu
+        
+        # Image upload (chỉ hiện khi chọn Image to Image)
+        self.image_group = QGroupBox("Ảnh Gốc")
+        image_layout = QVBoxLayout()
+        
+        # Subject Image
+        subject_layout = QVBoxLayout()
+        subject_header = QHBoxLayout()
+        subject_header.addWidget(QLabel("Subject:"))
+        self.subject_path_label = QLabel("Chưa chọn")
+        self.subject_path_label.setStyleSheet("color: gray; font-style: italic;")
+        subject_header.addWidget(self.subject_path_label)
+        self.select_subject_btn = QPushButton("Chọn")
+        self.select_subject_btn.clicked.connect(lambda: self.select_image("subject"))
+        subject_header.addWidget(self.select_subject_btn)
+        subject_layout.addLayout(subject_header)
+        
+        self.subject_caption_input = QLineEdit()
+        self.subject_caption_input.setPlaceholderText("Nhập caption cho ảnh Subject...")
+        self.subject_caption_input.setEnabled(False)
+        subject_layout.addWidget(self.subject_caption_input)
+        image_layout.addLayout(subject_layout)
+        
+        # Scene Image
+        scene_layout = QVBoxLayout()
+        scene_header = QHBoxLayout()
+        scene_header.addWidget(QLabel("Scene:"))
+        self.scene_path_label = QLabel("Chưa chọn")
+        self.scene_path_label.setStyleSheet("color: gray; font-style: italic;")
+        scene_header.addWidget(self.scene_path_label)
+        self.select_scene_btn = QPushButton("Chọn")
+        self.select_scene_btn.clicked.connect(lambda: self.select_image("scene"))
+        scene_header.addWidget(self.select_scene_btn)
+        scene_layout.addLayout(scene_header)
+        
+        self.scene_caption_input = QLineEdit()
+        self.scene_caption_input.setPlaceholderText("Nhập caption cho ảnh Scene...")
+        self.scene_caption_input.setEnabled(False)
+        scene_layout.addWidget(self.scene_caption_input)
+        image_layout.addLayout(scene_layout)
+        
+        # Style Image
+        style_layout = QVBoxLayout()
+        style_header = QHBoxLayout()
+        style_header.addWidget(QLabel("Style:"))
+        self.style_path_label = QLabel("Chưa chọn")
+        self.style_path_label.setStyleSheet("color: gray; font-style: italic;")
+        style_header.addWidget(self.style_path_label)
+        self.select_style_btn = QPushButton("Chọn")
+        self.select_style_btn.clicked.connect(lambda: self.select_image("style"))
+        style_header.addWidget(self.select_style_btn)
+        style_layout.addLayout(style_header)
+        
+        self.style_caption_input = QLineEdit()
+        self.style_caption_input.setPlaceholderText("Nhập caption cho ảnh Style...")
+        self.style_caption_input.setEnabled(False)
+        style_layout.addWidget(self.style_caption_input)
+        image_layout.addLayout(style_layout)
+        
+        self.image_group.setLayout(image_layout)
+        left_layout.addWidget(self.image_group, 1)  # Stretch factor = 1
+        self.image_group.setVisible(False)  # Ẩn ban đầu
+        
+        # Settings
+        settings_group = QGroupBox("Cài đặt")
+        settings_layout = QGridLayout()
+        
+        settings_layout.addWidget(QLabel("Seed:"), 0, 0)
+        self.seed_spinbox = QSpinBox()
+        self.seed_spinbox.setRange(0, 999999)
+        self.seed_spinbox.setValue(0)
+        settings_layout.addWidget(self.seed_spinbox, 0, 1)
+        
+        settings_layout.addWidget(QLabel("Số lượng:"), 1, 0)
+        self.count_spinbox = QSpinBox()
+        self.count_spinbox.setRange(1, 10)
+        self.count_spinbox.setValue(1)
+        settings_layout.addWidget(self.count_spinbox, 1, 1)
+        
+        # Thread count cho Excel mode
+        settings_layout.addWidget(QLabel("Số luồng:"), 2, 0)
+        self.thread_spinbox = QSpinBox()
+        self.thread_spinbox.setRange(1, 5)  # Tối đa 5 luồng
+        self.thread_spinbox.setValue(5)     # Mặc định 5 luồng
+        settings_layout.addWidget(self.thread_spinbox, 2, 1)
+        
+        
+        # Aspect ratio
+        settings_layout.addWidget(QLabel("Tỷ lệ:"), 4, 0)
+        self.aspect_combo = QComboBox()
+        self.aspect_combo.addItems([
+            "1:1 (Square)", 
+            "16:9 (Landscape)", 
+            "9:16 (Portrait)"
+        ])
+        self.aspect_combo.setCurrentText("16:9 (Landscape)")  # Mặc định
+        settings_layout.addWidget(self.aspect_combo, 4, 1)
+        
+        settings_group.setLayout(settings_layout)
+        left_layout.addWidget(settings_group, 0)  # Stretch factor = 0 (không mở rộng)
+        
+        # Output folder selection
+        output_group = QGroupBox("Thư mục lưu ảnh")
+        output_layout = QHBoxLayout()
+        
+        self.output_folder_label = QLabel("Chưa chọn thư mục")
+        self.output_folder_label.setStyleSheet("color: #666; font-style: italic;")
+        output_layout.addWidget(self.output_folder_label)
+        
+        self.select_folder_btn = QPushButton("Chọn thư mục")
+        self.select_folder_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        self.select_folder_btn.clicked.connect(self.select_output_folder)
+        output_layout.addWidget(self.select_folder_btn)
+        
+        output_group.setLayout(output_layout)
+        left_layout.addWidget(output_group, 0)
+        
+        # Generate button
+        self.generate_btn = QPushButton("Tạo Ảnh")
+        self.generate_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                padding: 12px;
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.generate_btn.clicked.connect(self.generate_image)
+        left_layout.addWidget(self.generate_btn, 0)  # Stretch factor = 0 (không mở rộng)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setMaximumHeight(40)  # Cùng chiều cao với button
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #e0e0e0;
+                border-radius: 6px;
+                text-align: center;
+                font-weight: bold;
+                font-family: "Open Sans";
+                font-size: 12px;
+                background-color: #f5f5f5;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4CAF50, stop:1 #45a049);
+                border-radius: 4px;
+            }
+        """)
+        left_layout.addWidget(self.progress_bar, 0)  # Stretch factor = 0 (không mở rộng)
+        
+        left_panel.setLayout(left_layout)
+        
+        # Panel phải - Log
+        right_panel = QWidget()
+        right_layout = QVBoxLayout()
+        
+        log_label = QLabel("Nhật ký")
+        log_label.setStyleSheet("font-weight: bold;")
+        right_layout.addWidget(log_label)
+        
+        self.log_text = QTextBrowser()
+        self.log_text.setStyleSheet("""
+            QTextBrowser {
+                background-color: #1e1e1e;
+                color: #ffffff;
+                border: 1px solid #404040;
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                font-size: 12px;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QTextBrowser QScrollBar:vertical {
+                background-color: #2d2d2d;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QTextBrowser QScrollBar::handle:vertical {
+                background-color: #555555;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QTextBrowser QScrollBar::handle:vertical:hover {
+                background-color: #777777;
+            }
+            QTextBrowser QScrollBar::add-line:vertical,
+            QTextBrowser QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        right_layout.addWidget(self.log_text)
+        
+        right_panel.setLayout(right_layout)
+        
+        # Thêm panels vào splitter
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([400, 300])
+        
+        generation_layout.addWidget(splitter)
+        generation_group.setLayout(generation_layout)
+        
+        layout.addWidget(generation_group)
+        self.setLayout(layout)
+        
+        # Biến lưu trữ
+        self.selected_subject_path = None
+        self.selected_scene_path = None
+        self.selected_style_path = None
+        self.selected_excel_path = None
+        self.generation_thread = None
+    
+    def select_output_folder(self):
+        """Chọn thư mục lưu ảnh"""
+        folder_path = QFileDialog.getExistingDirectory(
+            self, 
+            "Chọn thư mục lưu ảnh",
+            "",  # Bắt đầu từ thư mục hiện tại
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        
+        if folder_path:
+            self.output_folder_path = folder_path
+            # Hiển thị đường dẫn ngắn gọn
+            folder_name = os.path.basename(folder_path)
+            if len(folder_path) > 50:
+                display_path = f"...{folder_path[-47:]}"
+            else:
+                display_path = folder_path
+            
+            self.output_folder_label.setText(display_path)
+            self.output_folder_label.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            self.log_message(f"📁 Đã chọn thư mục lưu ảnh: {folder_path}")
+    
+    def load_accounts(self):
+        """Load danh sách tài khoản"""
+        self.account_combo.clear()
+        
+        try:
+            if os.path.exists('cookies.json'):
+                with open('cookies.json', 'r', encoding='utf-8') as f:
+                    cookies_data = json.load(f)
+                
+                for account_name, data in cookies_data.items():
+                    if data.get('validated', False):
+                        email = data.get('user_info', {}).get('email', 'N/A')
+                        last_checked = data.get('user_info', {}).get('last_checked', 'Chưa kiểm tra')
+                        expires_at = data.get('user_info', {}).get('expires_at', 'Unknown')
+                        
+                        # Hiển thị thông tin chi tiết hơn
+                        display_text = f"{account_name} ({email})"
+                        
+                        # Thêm thông tin về trạng thái token
+                        if expires_at in ['Parse Error', 'No Expires Info']:
+                            display_text += " [LỖI TOKEN]"
+                        elif expires_at != 'Unknown':
+                            try:
+                                from datetime import datetime
+                                expiry_time = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+                                current_time = datetime.now()
+                                
+                                if current_time > expiry_time:
+                                    display_text += " [HẾT HẠN]"
+                                else:
+                                    display_text += " [HỢP LỆ]"
+                            except:
+                                display_text += " [LỖI PARSE]"
+                        
+                        self.account_combo.addItem(display_text, account_name)
+        except Exception as e:
+            self.log_message(f"Lỗi khi load tài khoản: {str(e)}")
+    
+    def on_mode_changed(self, mode):
+        """Xử lý khi thay đổi chế độ"""
+        is_excel_mode = "Excel" in mode
+        is_img2img_mode = "Image to Image" in mode
+        
+        # Hiện/ẩn các group tương ứng
+        self.prompt_group.setVisible(not is_excel_mode)
+        self.excel_group.setVisible(is_excel_mode)
+        self.image_group.setVisible(is_img2img_mode and not is_excel_mode)
+        
+        # Reset data khi thay đổi mode
+        if not is_excel_mode:
+            self.selected_excel_path = None
+            self.excel_path_label.setText("Chưa chọn file Excel")
+            self.excel_preview_label.setText("")
+            self.excel_table.setRowCount(0)
+            # Reset về 8 cột cho Image to Image mode
+            self.excel_table.setColumnCount(8)
+            self.excel_table.setHorizontalHeaderLabels(["STT", "PROMPT", "SUBJECT", "SUBJECT_CAPTION", "SCENE", "SCENE_CAPTION", "STYLE", "STYLE_CAPTION"])
+        
+        if not is_img2img_mode:
+            self.selected_subject_path = None
+            self.selected_scene_path = None
+            self.selected_style_path = None
+            self.subject_path_label.setText("Chưa chọn")
+            self.scene_path_label.setText("Chưa chọn")
+            self.style_path_label.setText("Chưa chọn")
+            self.subject_caption_input.setEnabled(False)
+            self.subject_caption_input.setText("")
+            self.scene_caption_input.setEnabled(False)
+            self.scene_caption_input.setText("")
+            self.style_caption_input.setEnabled(False)
+            self.style_caption_input.setText("")
+    
+    def select_image(self, image_type):
+        """Chọn ảnh gốc theo loại"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, f"Chọn ảnh {image_type}", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.gif)")
+        
+        if file_path:
+            if image_type == "subject":
+                self.selected_subject_path = file_path
+                self.subject_path_label.setText(os.path.basename(file_path))
+                self.subject_path_label.setStyleSheet("color: black;")
+                self.subject_caption_input.setEnabled(True)
+                self.subject_caption_input.setText("Subject")  # Default caption
+            elif image_type == "scene":
+                self.selected_scene_path = file_path
+                self.scene_path_label.setText(os.path.basename(file_path))
+                self.scene_path_label.setStyleSheet("color: black;")
+                self.scene_caption_input.setEnabled(True)
+                self.scene_caption_input.setText("Scene")  # Default caption
+            elif image_type == "style":
+                self.selected_style_path = file_path
+                self.style_path_label.setText(os.path.basename(file_path))
+                self.style_path_label.setStyleSheet("color: black;")
+                self.style_caption_input.setEnabled(True)
+                self.style_caption_input.setText("Style")  # Default caption
+    
+    def select_excel_file(self):
+        """Chọn file Excel"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file Excel", "", "Excel Files (*.xlsx *.xls)")
+        
+        if file_path:
+            self.selected_excel_path = file_path
+            self.excel_path_label.setText(os.path.basename(file_path))
+            self.excel_path_label.setStyleSheet("color: black;")
+            
+            # Preview Excel data
+            self.preview_excel_data(file_path)
+    
+    def preview_excel_data(self, file_path):
+        """Preview dữ liệu Excel"""
+        try:
+            import pandas as pd
+            
+            mode = self.mode_combo.currentText()
+            df = pd.read_excel(file_path)
+            
+            if "Excel" in mode:
+                # Excel: STT, PROMPT, SUBJECT, SUBJECT_CAPTION, SCENE, SCENE_CAPTION, STYLE, STYLE_CAPTION
+                if len(df.columns) >= 2:
+                    stt_list = df.iloc[:, 0].tolist()
+                    prompt_list = df.iloc[:, 1].tolist()
+                    
+                    # Lấy các cột ảnh và caption (có thể để trống)
+                    subject_list = df.iloc[:, 2].fillna("").tolist() if len(df.columns) > 2 else [""] * len(stt_list)
+                    subject_caption_list = df.iloc[:, 3].fillna("").tolist() if len(df.columns) > 3 else [""] * len(stt_list)
+                    scene_list = df.iloc[:, 4].fillna("").tolist() if len(df.columns) > 4 else [""] * len(stt_list)
+                    scene_caption_list = df.iloc[:, 5].fillna("").tolist() if len(df.columns) > 5 else [""] * len(stt_list)
+                    style_list = df.iloc[:, 6].fillna("").tolist() if len(df.columns) > 6 else [""] * len(stt_list)
+                    style_caption_list = df.iloc[:, 7].fillna("").tolist() if len(df.columns) > 7 else [""] * len(stt_list)
+                    
+                    # Tự động detect mode dựa trên dữ liệu
+                    has_images = any(
+                        str(subject).strip() and str(subject).strip().lower() != 'nan' or
+                        str(scene).strip() and str(scene).strip().lower() != 'nan' or
+                        str(style).strip() and str(style).strip().lower() != 'nan'
+                        for subject, scene, style in zip(subject_list, scene_list, style_list)
+                    )
+                    
+                    detected_mode = "Image to Image" if has_images else "Prompt to Image"
+                    preview_text = f"📊 Đã đọc {len(stt_list)} dòng dữ liệu - Tự động detect: {detected_mode}"
+                    self.excel_preview_label.setText(preview_text)
+                    
+                    # Hiển thị trong table (8 cột)
+                    self.excel_table.setColumnCount(8)
+                    self.excel_table.setHorizontalHeaderLabels(["STT", "PROMPT", "SUBJECT", "SUBJECT_CAPTION", "SCENE", "SCENE_CAPTION", "STYLE", "STYLE_CAPTION"])
+                    self.excel_table.setRowCount(len(stt_list))
+                    
+                    for i, (stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption) in enumerate(zip(
+                        stt_list, prompt_list, subject_list, subject_caption_list, 
+                        scene_list, scene_caption_list, style_list, style_caption_list)):
+                        
+                        # STT
+                        stt_item = QTableWidgetItem(str(stt))
+                        stt_item.setTextAlignment(Qt.AlignCenter)
+                        self.excel_table.setItem(i, 0, stt_item)
+                        
+                        # Prompt
+                        prompt_item = QTableWidgetItem(str(prompt))
+                        self.excel_table.setItem(i, 1, prompt_item)
+                        
+                        # Subject
+                        subject_item = QTableWidgetItem(str(subject))
+                        self.excel_table.setItem(i, 2, subject_item)
+                        
+                        # Subject Caption
+                        subject_caption_item = QTableWidgetItem(str(subject_caption))
+                        self.excel_table.setItem(i, 3, subject_caption_item)
+                        
+                        # Scene
+                        scene_item = QTableWidgetItem(str(scene))
+                        self.excel_table.setItem(i, 4, scene_item)
+                        
+                        # Scene Caption
+                        scene_caption_item = QTableWidgetItem(str(scene_caption))
+                        self.excel_table.setItem(i, 5, scene_caption_item)
+                        
+                        # Style
+                        style_item = QTableWidgetItem(str(style))
+                        self.excel_table.setItem(i, 6, style_item)
+                        
+                        # Style Caption
+                        style_caption_item = QTableWidgetItem(str(style_caption))
+                        self.excel_table.setItem(i, 7, style_caption_item)
+                else:
+                    preview_text = "❌ File Excel cần có ít nhất 2 cột: STT, PROMPT"
+                    self.excel_preview_label.setText(preview_text)
+                    self.excel_table.setRowCount(0)
+            
+        except Exception as e:
+            self.excel_preview_label.setText(f"❌ Lỗi khi đọc file Excel: {str(e)}")
+            self.excel_preview_label.setStyleSheet("color: red; font-size: 12px;")
+            self.excel_table.setRowCount(0)
+    
+    def get_aspect_ratio(self):
+        """Lấy aspect ratio từ combo box"""
+        aspect_text = self.aspect_combo.currentText()
+        if "Square" in aspect_text:
+            return "IMAGE_ASPECT_RATIO_SQUARE"
+        elif "Portrait" in aspect_text:
+            return "IMAGE_ASPECT_RATIO_PORTRAIT"
+        else:  # Landscape
+            return "IMAGE_ASPECT_RATIO_LANDSCAPE"
+    
+    def log_message(self, message):
+        """Thêm message vào log với màu sắc"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        # Xác định màu sắc dựa trên nội dung message
+        if "✅" in message or "thành công" in message.lower():
+            color = "#4CAF50"  # Xanh lá
+        elif "❌" in message or "lỗi" in message.lower() or "error" in message.lower():
+            color = "#F44336"  # Đỏ
+        elif "⚠️" in message or "cảnh báo" in message.lower() or "warning" in message.lower():
+            color = "#FF9800"  # Cam
+        elif "🔧" in message or "hướng dẫn" in message.lower():
+            color = "#2196F3"  # Xanh dương
+        elif "📊" in message or "thống kê" in message.lower():
+            color = "#9C27B0"  # Tím
+        elif "🔄" in message or "đang" in message.lower():
+            color = "#00BCD4"  # Cyan
         else:
-            if response:
-                log_error(f"Lỗi khi upload ảnh: {response.status_code}")
-                log_error(response.text)
-            return None
-    except requests.exceptions.Timeout:
-        spinner.stop()
-        log_error("Timeout khi upload ảnh")
-        return None
-    except Exception as e:
-        spinner.stop()
-        log_error(f"Lỗi khi upload ảnh: {e}")
-        return None
-
-def generate_image_from_multiple_images(access_token, upload_data_list, user_instruction, seed, image_model="IMAGEN_3_5", aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE"):
-    """Tạo ảnh từ nhiều ảnh đã upload"""
-    url = "https://aisandbox-pa.googleapis.com/v1/whisk:runImageRecipe"
-    
-    headers = browser_sim.get_api_headers(access_token=access_token)
-    
-    # Tạo recipeMediaInputs từ upload_data_list
-    recipe_media_inputs = []
-    for upload_data in upload_data_list:
-        recipe_media_inputs.append({
-            "caption": upload_data.get('caption', ''),
-            "mediaInput": {
-                "mediaCategory": upload_data['mediaCategory'],
-                "mediaGenerationId": upload_data['uploadMediaGenerationId']
-            }
-        })
-    
-    payload = {
-        "clientContext": {
-            "workflowId": upload_data_list[0]['workflowId'] if upload_data_list else "",
-            "tool": "BACKBONE",
-            "sessionId": upload_data_list[0]['sessionId'] if upload_data_list else ""
-        },
-        "seed": seed,
-        "imageModelSettings": {
-            "imageModel": image_model,
-            "aspectRatio": aspect_ratio
-        },
-        "userInstruction": user_instruction,
-        "recipeMediaInputs": recipe_media_inputs
-    }
-    
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        log_error(f"Lỗi khi tạo ảnh từ nhiều ảnh: {e}")
-        return None
-
-def generate_image_from_image(access_token, upload_data, user_instruction, seed, image_model="IMAGEN_3_5", aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE"):
-    """Tạo ảnh từ ảnh đã upload"""
-    url = "https://aisandbox-pa.googleapis.com/v1/whisk:runImageRecipe"
-    
-    headers = browser_sim.get_api_headers(access_token=access_token)
-    
-    payload = {
-        "clientContext": {
-            "workflowId": upload_data['workflowId'],
-            "tool": "BACKBONE",
-            "sessionId": upload_data['sessionId']
-        },
-        "seed": seed,
-        "imageModelSettings": {
-            "imageModel": image_model,
-            "aspectRatio": aspect_ratio
-        },
-        "userInstruction": user_instruction,
-        "recipeMediaInputs": [
-            {
-                "caption": upload_data.get('caption', ''),
-                "mediaInput": {
-                    "mediaCategory": "MEDIA_CATEGORY_SUBJECT",
-                    "mediaGenerationId": upload_data['uploadMediaGenerationId']
-                }
-            },
-            {
-                "caption": upload_data.get('caption', ''),
-                "mediaInput": {
-                    "mediaCategory": "MEDIA_CATEGORY_SCENE",
-                    "mediaGenerationId": upload_data['uploadMediaGenerationId']
-                }
-            },
-            {
-                "caption": upload_data.get('caption', ''),
-                "mediaInput": {
-                    "mediaCategory": "MEDIA_CATEGORY_STYLE",
-                    "mediaGenerationId": upload_data['uploadMediaGenerationId']
-                }
-            }
-        ]
-    }
-    
-    
-    # Hiển thị loading spinner
-    spinner = LoadingSpinner("Đang tạo ảnh từ ảnh với AI...", Fore.MAGENTA)
-    spinner.start()
-    
-    try:
-        response = browser_sim.make_request("POST", url, headers=headers, json=payload, timeout=60)
-        spinner.stop()
+            color = "#FFFFFF"  # Trắng mặc định
         
-        if response and response.status_code == 200:
-            return response.json()
+        # Tạo HTML với màu sắc
+        html_message = f'<span style="color: {color};">[{timestamp}] {message}</span>'
+        self.log_text.append(html_message)
+        
+        # Scroll xuống cuối
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
+    
+    def generate_image(self):
+        """Tạo ảnh"""
+        # Kiểm tra dữ liệu đầu vào
+        if self.account_combo.count() == 0:
+            QMessageBox.warning(self, "Lỗi", "Chưa có tài khoản nào")
+            return
+        
+        # Kiểm tra đã chọn thư mục lưu ảnh chưa
+        if not self.output_folder_path:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn thư mục lưu ảnh")
+            return
+        
+        mode = self.mode_combo.currentText()
+        is_excel_mode = "Excel" in mode
+        
+        # Kiểm tra dữ liệu theo mode
+        if is_excel_mode:
+            if not self.selected_excel_path:
+                QMessageBox.warning(self, "Lỗi", "Vui lòng chọn file Excel")
+                return
         else:
-            if response:
-                log_error(f"Lỗi khi tạo ảnh từ ảnh: {response.status_code}")
-                log_error(response.text)
-            return None
-    except requests.exceptions.Timeout:
-        spinner.stop()
-        log_error("Timeout khi tạo ảnh từ ảnh")
-        return None
-    except Exception as e:
-        spinner.stop()
-        log_error(f"Lỗi khi tạo ảnh từ ảnh: {e}")
-        return None
+            prompt = self.prompt_text.toPlainText().strip()
+            if not prompt:
+                QMessageBox.warning(self, "Lỗi", "Vui lòng nhập prompt")
+                return
+            
+            if mode == "Image to Image":
+                if not self.selected_subject_path and not self.selected_scene_path and not self.selected_style_path:
+                    QMessageBox.warning(self, "Lỗi", "Vui lòng chọn ít nhất một ảnh (Subject, Scene, hoặc Style)")
+                    return
+        
+        # Lấy thông tin tài khoản
+        account_name = self.account_combo.currentData()
+        try:
+            with open('cookies.json', 'r', encoding='utf-8') as f:
+                cookies_data = json.load(f)
+            
+            if account_name not in cookies_data:
+                QMessageBox.warning(self, "Lỗi", "Tài khoản không tồn tại")
+                return
+            
+            cookie_data = cookies_data[account_name]
+            cookie = cookie_data['cookie']
+            saved_access_token = cookie_data.get('user_info', {}).get('access_token')
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Không thể đọc thông tin tài khoản: {str(e)}")
+            return
+        
+        # Disable button và hiện progress
+        self.generate_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # Indeterminate progress
+        
+        # Tạo thread để generate
+        aspect_ratio = self.get_aspect_ratio()
+        if is_excel_mode:
+            # Sử dụng ExcelGenerationThread cho một tài khoản
+            self.generation_thread = ExcelGenerationThread(
+                cookie, saved_access_token, mode, self.selected_excel_path, 
+                self.seed_spinbox.value(), self.thread_spinbox.value(), aspect_ratio,
+                self.output_folder_path
+            )
+        else:
+            prompt = self.prompt_text.toPlainText().strip()
+            self.generation_thread = ImageGenerationThread(
+                cookie, saved_access_token, prompt, mode, 
+                self.selected_subject_path, self.selected_scene_path, self.selected_style_path,
+                self.subject_caption_input.text(), self.scene_caption_input.text(), self.style_caption_input.text(),
+                self.seed_spinbox.value(), self.count_spinbox.value(), aspect_ratio,
+                self.output_folder_path
+            )
+        
+        self.generation_thread.progress.connect(self.log_message)
+        self.generation_thread.finished.connect(self.on_generation_finished)
+        self.generation_thread.start()
+    
+    def on_generation_finished(self, success, message):
+        """Xử lý khi hoàn thành tạo ảnh"""
+        self.generate_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        
+        if success:
+            QMessageBox.information(self, "Thành công", message)
+        else:
+            QMessageBox.warning(self, "Lỗi", message)
 
-def sanitize_filename(stt_value, prompt_text, max_prompt_length=80):
-    """Tạo tên file an toàn cho Windows: STT_PROMPT.jpg"""
-    invalid_chars = '\\/:*?"<>|'
-    safe = ''.join(
-        (ch if (ch.isalnum() or ch in (' ', '-', '_')) and ch not in invalid_chars else '_')
-        for ch in str(prompt_text)
-    )
-    safe = ' '.join(safe.split())  # chuẩn hóa khoảng trắng
-    safe = safe.strip(' .')  # bỏ dấu chấm hoặc space ở cuối
-    if len(safe) > max_prompt_length:
-        safe = safe[:max_prompt_length].rstrip()
-    if not safe:
-        safe = 'image'
-    return f"{stt_value}_{safe}.jpg"
 
+class ExcelGenerationThread(QThread):
+    """Thread để tạo ảnh từ Excel"""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+    
+    def __init__(self, cookie, saved_access_token, mode, excel_path, seed, thread_count, aspect_ratio, output_folder=None):
+        super().__init__()
+        self.cookie = cookie
+        self.saved_access_token = saved_access_token
+        self.mode = mode
+        self.excel_path = excel_path
+        self.seed = seed
+        self.thread_count = thread_count
+        self.aspect_ratio = aspect_ratio
+        self.output_folder = output_folder
+    
+    def test_access_token(self, access_token):
+        """Test xem access token có còn hợp lệ không"""
+        try:
+            # Kiểm tra thời gian hết hạn trước (nếu có thông tin)
+            # Đọc thông tin từ cookies.json để lấy expires_at
+            try:
+                with open('cookies.json', 'r', encoding='utf-8') as f:
+                    cookies_data = json.load(f)
+                
+                # Tìm tài khoản có access_token này
+                for account_name, data in cookies_data.items():
+                    saved_token = data.get('user_info', {}).get('access_token')
+                    if saved_token == access_token:
+                        expires_at = data.get('user_info', {}).get('expires_at')
+                        if expires_at and expires_at != 'Unknown':
+                            try:
+                                from datetime import datetime
+                                expiry_time = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+                                current_time = datetime.now()
+                                
+                                if current_time > expiry_time:
+                                    # Token đã hết hạn theo thời gian
+                                    return False
+                                else:
+                                    # Token còn hợp lệ theo thời gian, test bằng API
+                                    break
+                            except:
+                                # Lỗi parse thời gian, test bằng API
+                                break
+                        else:
+                            # Không có thông tin thời gian, test bằng API
+                            break
+            except:
+                # Lỗi đọc file, test bằng API
+                pass
+            
+            # Test bằng cách gọi API session để kiểm tra token
+            from main import browser_sim
+            url = "https://labs.google/fx/api/auth/session"
+            headers = browser_sim.get_api_headers(access_token=access_token)
+            
+            # Chỉ test với timeout ngắn
+            response = browser_sim.make_request("GET", url, headers=headers, timeout=10)
+            
+            if response and response.status_code == 200:
+                return True
+            elif response and response.status_code == 401:
+                return False
+            else:
+                # Nếu không phải 401, có thể là lỗi khác, coi như token hợp lệ
+                return True
+                
+        except Exception as e:
+            # Nếu có lỗi, coi như token không hợp lệ
+            return False
+    
+    def run(self):
+        try:
+            import pandas as pd
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            # Kiểm tra và lấy access token hợp lệ
+            self.progress.emit("Đang xác thực tài khoản...")
+            
+            if self.saved_access_token:
+                # Thử sử dụng access token đã lưu trước
+                self.progress.emit("Kiểm tra access token đã lưu...")
+                
+                # Test token bằng cách gọi API đơn giản
+                test_result = self.test_access_token(self.saved_access_token)
+                
+                if test_result:
+                    access_token = self.saved_access_token
+                    self.progress.emit("✅ Token đã lưu vẫn hợp lệ")
+                else:
+                    self.progress.emit("⚠️ Token đã lưu đã hết hạn, đang lấy token mới...")
+                    access_data = get_access_token(self.cookie)
+                    
+                    if not access_data or not access_data.get('access_token'):
+                        self.finished.emit(False, "Không thể xác thực tài khoản - Cookie có thể đã hết hạn. Vui lòng cập nhật cookie mới.")
+                        return
+                    
+                    access_token = access_data.get('access_token')
+                    self.progress.emit("✅ Đã lấy token mới thành công")
+            else:
+                # Lấy access token mới
+                access_data = get_access_token(self.cookie)
+                
+                if not access_data or not access_data.get('access_token'):
+                    self.finished.emit(False, "Không thể xác thực tài khoản - Cookie có thể đã hết hạn. Vui lòng cập nhật cookie mới.")
+                    return
+                
+                access_token = access_data.get('access_token')
+                self.progress.emit("✅ Xác thực thành công")
+            
+            # Sử dụng thư mục output đã được truyền vào
+            if not self.output_folder:
+                self.finished.emit(False, "Không có thư mục lưu ảnh được chỉ định")
+                return
+            
+            if not os.path.exists(self.output_folder):
+                os.makedirs(self.output_folder)
+            
+            # Đọc dữ liệu Excel
+            self.progress.emit("Đang đọc file Excel...")
+            
+            if "Excel" in self.mode:
+                # Excel: STT, PROMPT, SUBJECT, SUBJECT_CAPTION, SCENE, SCENE_CAPTION, STYLE, STYLE_CAPTION
+                df = pd.read_excel(self.excel_path)
+                if len(df.columns) < 2:
+                    self.finished.emit(False, "File Excel cần có ít nhất 2 cột: STT, PROMPT")
+                    return
+                
+                stt_list = df.iloc[:, 0].tolist()
+                prompt_list = df.iloc[:, 1].tolist()
+                
+                # Lấy các cột ảnh và caption (có thể để trống)
+                subject_list = df.iloc[:, 2].fillna("").tolist() if len(df.columns) > 2 else [""] * len(stt_list)
+                subject_caption_list = df.iloc[:, 3].fillna("").tolist() if len(df.columns) > 3 else [""] * len(stt_list)
+                scene_list = df.iloc[:, 4].fillna("").tolist() if len(df.columns) > 4 else [""] * len(stt_list)
+                scene_caption_list = df.iloc[:, 5].fillna("").tolist() if len(df.columns) > 5 else [""] * len(stt_list)
+                style_list = df.iloc[:, 6].fillna("").tolist() if len(df.columns) > 6 else [""] * len(stt_list)
+                style_caption_list = df.iloc[:, 7].fillna("").tolist() if len(df.columns) > 7 else [""] * len(stt_list)
+                
+                # Tự động detect mode và validate dữ liệu
+                valid_data = []
+                prompt_to_image_count = 0
+                image_to_image_count = 0
+                
+                for i, (stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption) in enumerate(zip(
+                    stt_list, prompt_list, subject_list, subject_caption_list, 
+                    scene_list, scene_caption_list, style_list, style_caption_list)):
+                    
+                    # Kiểm tra prompt có hợp lệ không
+                    if not str(prompt).strip() or str(prompt).strip().lower() == 'nan':
+                        continue
+                    
+                    # Kiểm tra có ảnh nào không
+                    has_images = (
+                        str(subject).strip() and str(subject).strip().lower() != 'nan' or
+                        str(scene).strip() and str(scene).strip().lower() != 'nan' or
+                        str(style).strip() and str(style).strip().lower() != 'nan'
+                    )
+                    
+                    if has_images:
+                        # Image to Image: cần ít nhất 1 ảnh
+                        image_to_image_count += 1
+                        valid_data.append((stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption, "Image to Image"))
+                    else:
+                        # Prompt to Image: chỉ cần prompt
+                        prompt_to_image_count += 1
+                        valid_data.append((stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption, "Prompt to Image"))
+                
+                # Thống kê
+                total_valid = len(valid_data)
+                self.progress.emit(f"📊 Validation: {total_valid} dòng hợp lệ ({prompt_to_image_count} Prompt to Image, {image_to_image_count} Image to Image)")
+                
+                excel_data = valid_data
+            
+            if not excel_data:
+                self.finished.emit(False, "Không có dữ liệu trong file Excel")
+                return
+            
+            self.progress.emit(f"✅ Đã đọc {len(excel_data)} dòng dữ liệu từ Excel")
+            self.progress.emit(f"Bắt đầu tạo ảnh với {self.thread_count} luồng...")
+            
+            # Tạo danh sách tasks
+            tasks = []
+            for i, data in enumerate(excel_data):
+                stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption, mode = data
+                if mode == "Image to Image":
+                    task_data = (stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption, 
+                               access_token, self.cookie, self.output_folder, self.seed + i, self.aspect_ratio, "img2img")
+                else:
+                    task_data = (stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption, 
+                               access_token, self.output_folder, self.seed + i, self.aspect_ratio, "prompt")
+                tasks.append(task_data)
+            
+            success_count = 0
+            
+            # Sử dụng ThreadPoolExecutor để xử lý multi-threading
+            with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
+                # Submit tất cả tasks theo mode riêng
+                future_to_task = {}
+                for task in tasks:
+                    # Lấy mode từ task data (phần tử cuối cùng)
+                    task_mode = task[-1]
+                    if task_mode == "img2img":
+                        future_to_task[executor.submit(self.process_single_img2img_task, task)] = task
+                    else:
+                        future_to_task[executor.submit(self.process_single_image_task, task)] = task
+                
+                # Xử lý kết quả khi hoàn thành
+                for future in as_completed(future_to_task):
+                    task = future_to_task[future]
+                    stt = task[0]
+                    
+                    try:
+                        result = future.result()
+                        if result:
+                            self.progress.emit(f"✅ Hoàn thành STT {stt}")
+                            success_count += 1
+                        else:
+                            self.progress.emit(f"❌ Lỗi STT {stt} - Có thể do access token hết hạn")
+                            # Nếu có nhiều lỗi liên tiếp, có thể do token hết hạn
+                            if success_count == 0 and len(future_to_task) > 1:
+                                self.progress.emit("💡 Hướng dẫn: Vào tab 'Quản lý Tài khoản' -> Chọn tài khoản -> Click 'Checker' để kiểm tra")
+                                self.progress.emit("💡 Nếu vẫn lỗi, hãy thêm cookie mới từ Google Labs")
+                    except Exception as e:
+                        self.progress.emit(f"❌ Exception STT {stt}: {str(e)}")
+                        if "401" in str(e) or "authentication" in str(e).lower():
+                            self.progress.emit("💡 Lỗi xác thực - Vui lòng cập nhật cookie mới")
+            
+            if success_count > 0:
+                self.finished.emit(True, f"Tạo thành công {success_count}/{len(excel_data)} ảnh trong thư mục '{self.output_folder}'")
+            else:
+                self.finished.emit(False, "Không tạo được ảnh nào - Có thể do access token hết hạn. Vui lòng cập nhật cookie mới.")
+                
+        except Exception as e:
+            self.finished.emit(False, f"Lỗi: {str(e)}")
+    
+    def process_single_image_task(self, task_data):
+        """Xử lý một task tạo ảnh trong thread"""
+        try:
+            # Kiểm tra mode để unpack đúng số lượng phần tử
+            task_mode = task_data[-1]  # Lấy mode từ phần tử cuối
+            
+            if task_mode == "img2img":
+                stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption, access_token, cookie, output_folder, seed, aspect_ratio, task_mode = task_data
+            else:
+                stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption, access_token, output_folder, seed, aspect_ratio, task_mode = task_data
+            
+            # Gọi API tạo ảnh (chỉ dùng prompt)
+            result = generate_image(access_token, prompt, seed, aspect_ratio, output_folder=output_folder)
+            
+            if result and 'imagePanels' in result:
+                for panel in result['imagePanels']:
+                    if 'generatedImages' in panel:
+                        for img in panel['generatedImages']:
+                            if 'encodedImage' in img:
+                                filename = sanitize_filename(stt, prompt)
+                                self.progress.emit(f"💾 Đang lưu ảnh: {filename}")
+                                print(f"💾 Đang lưu ảnh: {filename}")
+                                if save_base64_image(img['encodedImage'], filename, output_folder):
+                                    self.progress.emit(f"✅ Đã lưu thành công: {filename}")
+                                    print(f"✅ Đã lưu thành công: {filename}")
+                                    return True
+                                else:
+                                    self.progress.emit(f"❌ Lỗi khi lưu: {filename}")
+                                    print(f"❌ Lỗi khi lưu: {filename}")
+                                    return False
+            return False
+            
+        except Exception as e:
+            # Log lỗi chi tiết để debug
+            import traceback
+            self.progress.emit(f"❌ Exception trong process_single_image_task: {str(e)}")
+            print(f"❌ Exception trong process_single_image_task: {str(e)}")
+            self.progress.emit(f"❌ Traceback: {traceback.format_exc()}")
+            print(f"❌ Traceback: {traceback.format_exc()}")
+            return False
+    
+    def process_single_img2img_task(self, task_data):
+        """Xử lý một task tạo ảnh từ nhiều ảnh trong thread"""
+        stt, prompt, subject, subject_caption, scene, scene_caption, style, style_caption, access_token, cookie, output_folder, seed, aspect_ratio, task_mode = task_data
+        
+        try:
+            # Upload các ảnh đã chọn
+            upload_data_list = []
+            
+            if subject and str(subject).strip() and str(subject).strip().lower() != 'nan':
+                upload_data = upload_image_to_google_labs(cookie, str(subject).strip())
+                if upload_data:
+                    upload_data_list.append({
+                        'caption': str(subject_caption).strip() or 'Subject',
+                        'mediaCategory': 'MEDIA_CATEGORY_SUBJECT',
+                        'uploadMediaGenerationId': upload_data['uploadMediaGenerationId'],
+                        'workflowId': upload_data['workflowId'],
+                        'sessionId': upload_data['sessionId']
+                    })
+            
+            if scene and str(scene).strip() and str(scene).strip().lower() != 'nan':
+                upload_data = upload_image_to_google_labs(cookie, str(scene).strip())
+                if upload_data:
+                    upload_data_list.append({
+                        'caption': str(scene_caption).strip() or 'Scene',
+                        'mediaCategory': 'MEDIA_CATEGORY_SCENE',
+                        'uploadMediaGenerationId': upload_data['uploadMediaGenerationId'],
+                        'workflowId': upload_data['workflowId'],
+                        'sessionId': upload_data['sessionId']
+                    })
+            
+            if style and str(style).strip() and str(style).strip().lower() != 'nan':
+                upload_data = upload_image_to_google_labs(cookie, str(style).strip())
+                if upload_data:
+                    upload_data_list.append({
+                        'caption': str(style_caption).strip() or 'Style',
+                        'mediaCategory': 'MEDIA_CATEGORY_STYLE',
+                        'uploadMediaGenerationId': upload_data['uploadMediaGenerationId'],
+                        'workflowId': upload_data['workflowId'],
+                        'sessionId': upload_data['sessionId']
+                    })
+            
+            if upload_data_list:
+                result = generate_image_from_multiple_images(access_token, upload_data_list, prompt, seed, "IMAGEN_3_5", aspect_ratio, output_folder)
+                
+                if result and 'imagePanels' in result:
+                    for panel in result['imagePanels']:
+                        if 'generatedImages' in panel:
+                            for img in panel['generatedImages']:
+                                if 'encodedImage' in img:
+                                    filename = sanitize_filename(stt, prompt)
+                                    self.progress.emit(f"💾 Đang lưu ảnh img2img: {filename}")
+                                    if save_base64_image(img['encodedImage'], filename, output_folder):
+                                        self.progress.emit(f"✅ Đã lưu thành công img2img: {filename}")
+                                        return True
+                                    else:
+                                        self.progress.emit(f"❌ Lỗi khi lưu img2img: {filename}")
+                                        return False
+            return False
+            
+        except Exception as e:
+            return False
 
+class ImageGenerationThread(QThread):
+    """Thread để tạo ảnh"""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+    
+    def __init__(self, cookie, saved_access_token, prompt, mode, subject_path, scene_path, style_path, subject_caption, scene_caption, style_caption, seed, count, aspect_ratio, output_folder=None):
+        super().__init__()
+        self.cookie = cookie
+        self.saved_access_token = saved_access_token
+        self.prompt = prompt
+        self.mode = mode
+        self.subject_path = subject_path
+        self.scene_path = scene_path
+        self.style_path = style_path
+        self.subject_caption = subject_caption
+        self.scene_caption = scene_caption
+        self.style_caption = style_caption
+        self.seed = seed
+        self.count = count
+        self.aspect_ratio = aspect_ratio
+        self.output_folder = output_folder
+    
+    def test_access_token(self, access_token):
+        """Test xem access token có còn hợp lệ không"""
+        try:
+            # Kiểm tra thời gian hết hạn trước (nếu có thông tin)
+            # Đọc thông tin từ cookies.json để lấy expires_at
+            try:
+                with open('cookies.json', 'r', encoding='utf-8') as f:
+                    cookies_data = json.load(f)
+                
+                # Tìm tài khoản có access_token này
+                for account_name, data in cookies_data.items():
+                    saved_token = data.get('user_info', {}).get('access_token')
+                    if saved_token == access_token:
+                        expires_at = data.get('user_info', {}).get('expires_at')
+                        if expires_at and expires_at != 'Unknown':
+                            try:
+                                from datetime import datetime
+                                expiry_time = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+                                current_time = datetime.now()
+                                
+                                if current_time > expiry_time:
+                                    # Token đã hết hạn theo thời gian
+                                    return False
+                                else:
+                                    # Token còn hợp lệ theo thời gian, test bằng API
+                                    break
+                            except:
+                                # Lỗi parse thời gian, test bằng API
+                                break
+                        else:
+                            # Không có thông tin thời gian, test bằng API
+                            break
+            except:
+                # Lỗi đọc file, test bằng API
+                pass
+            
+            # Test bằng cách gọi API session để kiểm tra token
+            from main import browser_sim
+            url = "https://labs.google/fx/api/auth/session"
+            headers = browser_sim.get_api_headers(access_token=access_token)
+            
+            # Chỉ test với timeout ngắn
+            response = browser_sim.make_request("GET", url, headers=headers, timeout=10)
+            
+            if response and response.status_code == 200:
+                return True
+            elif response and response.status_code == 401:
+                return False
+            else:
+                # Nếu không phải 401, có thể là lỗi khác, coi như token hợp lệ
+                return True
+                
+        except Exception as e:
+            # Nếu có lỗi, coi như token không hợp lệ
+            return False
+    
+    def run(self):
+        try:
+            # Kiểm tra và lấy access token hợp lệ
+            self.progress.emit("Đang xác thực tài khoản...")
+            
+            if self.saved_access_token:
+                # Thử sử dụng access token đã lưu trước
+                self.progress.emit("Kiểm tra access token đã lưu...")
+                
+                # Test token bằng cách gọi API đơn giản
+                test_result = self.test_access_token(self.saved_access_token)
+                
+                if test_result:
+                    access_token = self.saved_access_token
+                    self.progress.emit("✅ Token đã lưu vẫn hợp lệ")
+                else:
+                    self.progress.emit("⚠️ Token đã lưu đã hết hạn, đang lấy token mới...")
+                    access_data = get_access_token(self.cookie)
+                    
+                    if not access_data or not access_data.get('access_token'):
+                        self.finished.emit(False, "Không thể xác thực tài khoản - Cookie có thể đã hết hạn. Vui lòng cập nhật cookie mới.")
+                        return
+                    
+                    access_token = access_data.get('access_token')
+                    self.progress.emit("✅ Đã lấy token mới thành công")
+            else:
+                # Lấy access token mới
+                access_data = get_access_token(self.cookie)
+                
+                if not access_data or not access_data.get('access_token'):
+                    self.finished.emit(False, "Không thể xác thực tài khoản - Cookie có thể đã hết hạn. Vui lòng cập nhật cookie mới.")
+                    return
+                
+                access_token = access_data.get('access_token')
+                self.progress.emit("✅ Xác thực thành công")
+            
+            # Sử dụng thư mục output đã được truyền vào
+            if not self.output_folder:
+                self.finished.emit(False, "Không có thư mục lưu ảnh được chỉ định")
+                return
+            
+            if not os.path.exists(self.output_folder):
+                os.makedirs(self.output_folder)
+            
+            success_count = 0
+            
+            for i in range(self.count):
+                self.progress.emit(f"Đang tạo ảnh {i+1}/{self.count}...")
+                
+                if self.mode == "Prompt to Image":
+                    # Prompt to Image
+                    result = generate_image(access_token, self.prompt, self.seed + i, self.aspect_ratio, output_folder=self.output_folder)
+                    
+                    if result and 'imagePanels' in result:
+                        for panel in result['imagePanels']:
+                            if 'generatedImages' in panel:
+                                for img in panel['generatedImages']:
+                                    if 'encodedImage' in img:
+                                        filename = sanitize_filename(i+1, self.prompt)
+                                        if save_base64_image(img['encodedImage'], filename, self.output_folder):
+                                            self.progress.emit(f"✅ Đã lưu: {filename}")
+                                            success_count += 1
+                                        else:
+                                            self.progress.emit(f"❌ Lỗi khi lưu: {filename}")
+                    elif result is None:
+                        # Nếu result là None, có thể do lỗi 401 (token hết hạn)
+                        self.progress.emit("❌ Lỗi xác thực - Access token có thể đã hết hạn")
+                        self.progress.emit("💡 Hướng dẫn: Vào tab 'Quản lý Tài khoản' -> Chọn tài khoản -> Click 'Checker' để kiểm tra")
+                        self.progress.emit("💡 Nếu vẫn lỗi, hãy thêm cookie mới từ Google Labs")
+                        break  # Dừng vòng lặp để tránh spam lỗi
+                
+                elif self.mode == "Image to Image":
+                    # Image to Image với 3 loại ảnh
+                    self.progress.emit("Đang upload ảnh...")
+                    
+                    # Upload các ảnh đã chọn
+                    upload_data_list = []
+                    
+                    if self.subject_path:
+                        self.progress.emit("Uploading Subject image...")
+                        subject_data = upload_image_to_google_labs(self.cookie, self.subject_path)
+                        if subject_data:
+                            upload_data_list.append({
+                                'caption': self.subject_caption or 'Subject',
+                                'mediaCategory': 'MEDIA_CATEGORY_SUBJECT',
+                                'uploadMediaGenerationId': subject_data['uploadMediaGenerationId'],
+                                'workflowId': subject_data['workflowId'],
+                                'sessionId': subject_data['sessionId']
+                            })
+                    
+                    if self.scene_path:
+                        self.progress.emit("Uploading Scene image...")
+                        scene_data = upload_image_to_google_labs(self.cookie, self.scene_path)
+                        if scene_data:
+                            upload_data_list.append({
+                                'caption': self.scene_caption or 'Scene',
+                                'mediaCategory': 'MEDIA_CATEGORY_SCENE',
+                                'uploadMediaGenerationId': scene_data['uploadMediaGenerationId'],
+                                'workflowId': scene_data['workflowId'],
+                                'sessionId': scene_data['sessionId']
+                            })
+                    
+                    if self.style_path:
+                        self.progress.emit("Uploading Style image...")
+                        style_data = upload_image_to_google_labs(self.cookie, self.style_path)
+                        if style_data:
+                            upload_data_list.append({
+                                'caption': self.style_caption or 'Style',
+                                'mediaCategory': 'MEDIA_CATEGORY_STYLE',
+                                'uploadMediaGenerationId': style_data['uploadMediaGenerationId'],
+                                'workflowId': style_data['workflowId'],
+                                'sessionId': style_data['sessionId']
+                            })
+                    
+                    if upload_data_list:
+                        self.progress.emit("✅ Upload thành công")
+                        result = generate_image_from_multiple_images(access_token, upload_data_list, self.prompt, self.seed + i, "IMAGEN_3_5", self.aspect_ratio, self.output_folder)
+                        
+                        if result and 'imagePanels' in result:
+                            for panel in result['imagePanels']:
+                                if 'generatedImages' in panel:
+                                    for img in panel['generatedImages']:
+                                        if 'encodedImage' in img:
+                                            filename = sanitize_filename(i+1, self.prompt)
+                                            if save_base64_image(img['encodedImage'], filename, self.output_folder):
+                                                self.progress.emit(f"✅ Đã lưu: {filename}")
+                                                success_count += 1
+                                            else:
+                                                self.progress.emit(f"❌ Lỗi khi lưu: {filename}")
+                        else:
+                            self.progress.emit("❌ Lỗi khi tạo ảnh")
+                    else:
+                        self.progress.emit("❌ Không có ảnh nào được upload thành công")
+            
+            if success_count > 0:
+                self.finished.emit(True, f"Tạo thành công {success_count} ảnh trong thư mục '{self.output_folder}'")
+            else:
+                self.finished.emit(False, "Không tạo được ảnh nào - Có thể do access token hết hạn. Vui lòng cập nhật cookie mới.")
+                
+        except Exception as e:
+            self.finished.emit(False, f"Lỗi: {str(e)}")
 
+class MainWindow(QMainWindow):
+    """Cửa sổ chính"""
+    
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+    
+    def init_ui(self):
+        self.setWindowTitle("Whisk AI Image Generator - @huyit32")
+        self.setGeometry(100, 100, 1200, 800)
+        
+        # Tạo tab widget
+        self.tab_widget = QTabWidget()
+        
+        # Tab quản lý tài khoản
+        self.account_tab = AccountManagementTab()
+        self.tab_widget.addTab(self.account_tab, "Quản lý Tài khoản")
+        
+        # Tab tạo ảnh
+        self.image_tab = ImageGenerationTab()
+        self.tab_widget.addTab(self.image_tab, "Tạo Ảnh")
+        
+        # Kết nối signal để cập nhật danh sách tài khoản khi có thay đổi
+        self.account_tab.account_updated.connect(self.image_tab.load_accounts)
+        
+        # Styling tab widget
+        self.tab_widget.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #c0c0c0;
+                background-color: white;
+            }
+            QTabBar::tab {
+                background-color: #f0f0f0;
+                padding: 8px 16px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                border-bottom: 2px solid #2196F3;
+            }
+            QTabBar::tab:hover {
+                background-color: #e0e0e0;
+            }
+        """)
+        
+        self.setCentralWidget(self.tab_widget)
+        
+        # Status bar
+        self.statusBar().showMessage("Sẵn sàng")
+        
+        # Menu bar
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu('File')
+        
+        exit_action = file_menu.addAction('Thoát')
+        exit_action.triggered.connect(self.close)
+        
+        # Help menu
+        help_menu = menubar.addMenu('Help')
+        
+        about_action = help_menu.addAction('Giới thiệu')
+        about_action.triggered.connect(self.show_about)
+    
+    def show_about(self):
+        """Hiển thị thông tin về ứng dụng"""
+        QMessageBox.about(self, "Giới thiệu", 
+                         "Whisk Cookie - AI Image Generator\n\n"
+                         "Ứng dụng tạo ảnh AI sử dụng Google Labs Whisk\n"
+                         "Phiên bản: 1.0\n"
+                         "Phát triển bởi: @huyit32")
 
+from auth.auth_guard import KeyLoginDialog, get_device_id
+from version_checker import check_for_update, CURRENT_VERSION
+import sys
 
+# Constants
+API_URL = "http://62.171.131.164:5000"
+API_AUTH_ENDPOINT = f"{API_URL}/api/merger_video_ai/auth"
+VERSION_CHECK_ENDPOINT = f"{API_URL}/api/version.json"
+def main():
+    app = QApplication(sys.argv)
+    
+    # Set font cho toàn bộ ứng dụng
+    font = QFont("Open Sans", 9)
+    app.setFont(font)
+    
+    # Create main window
+    if check_for_update(VERSION_CHECK_ENDPOINT):
+            return 0
+            
+        # Authenticate user
+    login_dialog = KeyLoginDialog(API_AUTH_ENDPOINT)
+    if login_dialog.exec_() != QDialog.Accepted or not login_dialog.validated:
+            return 0
+            
+        # Get authentication info
+    key_info = login_dialog.key_info
+    key = key_info.get("key")
+    expires_raw = key_info.get("expires", "")
+    remaining = key_info.get("remaining", 0)
+    device_id = get_device_id()[0]
+        
+        
+        # Create and show main UI
+    ui = MainWindow()
+    expires = expires_raw if expires_raw else "Unknown"
+    window_title = f"Whisk AI v{CURRENT_VERSION} - @huyit32 - KEY: {key} | Expires: {expires} | Remaining: {remaining}"
+    ui.setWindowTitle(window_title)
+    ui.show()
+    return app.exec_()
+
+if __name__ == '__main__':
+    main()
