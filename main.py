@@ -13,7 +13,8 @@ from datetime import datetime
 
 from api import (get_access_token, generate_image, 
                 generate_image_from_multiple_images,
-                 upload_image_to_google_labs, save_base64_image, sanitize_filename)
+                 upload_image_to_google_labs, save_base64_image, sanitize_filename,
+                 edit_image_with_prompt)
 import api  # Import module để truy cập biến global
 
 class CookieDialog(QDialog):
@@ -1825,6 +1826,718 @@ class ImageGenerationThread(QThread):
         except Exception as e:
             self.finished.emit(False, f"Lỗi: {str(e)}")
 
+class SyncTab(QWidget):
+    """Tab đồng bộ - Upload ảnh và edit với Excel"""
+    
+    def __init__(self):
+        super().__init__()
+        # Khởi tạo các biến
+        self.selected_image_path = None
+        self.selected_excel_path = None
+        self.output_folder_path = None
+        self.media_generation_id = None
+        self.raw_bytes = None
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
+        
+        # Sync Group Box
+        sync_group = QGroupBox("Đồng bộ Ảnh")
+        sync_layout = QVBoxLayout()
+        
+        # Splitter để chia 2 phần
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # Panel trái - Controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout()
+        left_layout.setContentsMargins(5, 5, 5, 5)
+        left_layout.setSpacing(10)
+        
+        # Chọn tài khoản
+        account_group = QGroupBox("Chọn Tài khoản")
+        account_layout = QVBoxLayout()
+        
+        self.account_combo = QComboBox()
+        self.load_accounts()
+        account_layout.addWidget(self.account_combo)
+        
+        account_group.setLayout(account_layout)
+        left_layout.addWidget(account_group)
+        
+        # Upload ảnh gốc
+        upload_group = QGroupBox("Ảnh Gốc")
+        upload_layout = QVBoxLayout()
+        
+        self.image_path_label = QLabel("Chưa chọn ảnh")
+        self.image_path_label.setStyleSheet("color: gray; font-style: italic;")
+        upload_layout.addWidget(self.image_path_label)
+        
+        self.select_image_btn = QPushButton("Chọn Ảnh")
+        self.select_image_btn.clicked.connect(self.select_image)
+        self.select_image_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        upload_layout.addWidget(self.select_image_btn)
+        
+        self.upload_btn = QPushButton("Upload Ảnh")
+        self.upload_btn.clicked.connect(self.upload_image)
+        self.upload_btn.setEnabled(False)
+        self.upload_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        upload_layout.addWidget(self.upload_btn)
+        
+        # Status upload
+        self.upload_status_label = QLabel("")
+        self.upload_status_label.setStyleSheet("color: blue; font-size: 12px;")
+        self.upload_status_label.setWordWrap(True)
+        upload_layout.addWidget(self.upload_status_label)
+        
+        upload_group.setLayout(upload_layout)
+        left_layout.addWidget(upload_group)
+        
+        # File Excel
+        excel_group = QGroupBox("File Excel")
+        excel_layout = QVBoxLayout()
+        
+        self.excel_path_label = QLabel("Chưa chọn file Excel")
+        self.excel_path_label.setStyleSheet("color: gray; font-style: italic;")
+        excel_layout.addWidget(self.excel_path_label)
+        
+        self.select_excel_btn = QPushButton("Chọn File Excel")
+        self.select_excel_btn.clicked.connect(self.select_excel_file)
+        self.select_excel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+        """)
+        excel_layout.addWidget(self.select_excel_btn)
+        
+        # Preview Excel data
+        self.excel_preview_label = QLabel("")
+        self.excel_preview_label.setStyleSheet("color: blue; font-size: 12px;")
+        self.excel_preview_label.setWordWrap(True)
+        excel_layout.addWidget(self.excel_preview_label)
+        
+        # Excel data table
+        self.excel_table = QTableWidget()
+        self.excel_table.setColumnCount(2)
+        self.excel_table.setHorizontalHeaderLabels(["STT", "PROMPT"])
+        self.excel_table.setStyleSheet("""
+            QTableWidget {
+                background-color: white;
+                border-radius: 3px;
+                gridline-color: #f0f0f0;
+                font-family: "Open Sans";
+                border: none;
+            }
+            QHeaderView::section {
+                background-color: #f8f9fa;
+                padding: 8px;
+                border: none;
+                border-right: 1px solid #f0f0f0;
+                border-bottom: 1px solid #e0e0e0;
+                font-weight: bold;
+                font-size: 12px;
+                font-family: "Open Sans";
+                color: #333;
+            }
+            QHeaderView::section:first {
+                border-left: none;
+            }
+            QHeaderView::section:last {
+                border-right: none;
+            }
+        """)
+        self.excel_table.setAlternatingRowColors(True)
+        self.excel_table.horizontalHeader().setStretchLastSection(True)
+        self.excel_table.verticalHeader().setDefaultSectionSize(35)
+        
+        # Căn giữa header
+        header = self.excel_table.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignCenter)
+        
+        excel_layout.addWidget(self.excel_table)
+        
+        excel_group.setLayout(excel_layout)
+        left_layout.addWidget(excel_group, 2)  # Stretch factor = 2
+        
+        # Settings
+        settings_group = QGroupBox("Cài đặt")
+        settings_layout = QGridLayout()
+        
+        settings_layout.addWidget(QLabel("Seed:"), 0, 0)
+        self.seed_spinbox = QSpinBox()
+        self.seed_spinbox.setRange(0, 999999)
+        self.seed_spinbox.setValue(0)
+        settings_layout.addWidget(self.seed_spinbox, 0, 1)
+        
+        # Thread count
+        settings_layout.addWidget(QLabel("Số luồng:"), 1, 0)
+        self.thread_spinbox = QSpinBox()
+        self.thread_spinbox.setRange(1, 5)
+        self.thread_spinbox.setValue(3)
+        settings_layout.addWidget(self.thread_spinbox, 1, 1)
+        
+        settings_group.setLayout(settings_layout)
+        left_layout.addWidget(settings_group, 0)
+        
+        # Output folder selection
+        output_group = QGroupBox("Thư mục lưu ảnh")
+        output_layout = QHBoxLayout()
+        
+        self.output_folder_label = QLabel("Chưa chọn thư mục")
+        self.output_folder_label.setStyleSheet("color: #666; font-style: italic;")
+        output_layout.addWidget(self.output_folder_label)
+        
+        self.select_folder_btn = QPushButton("Chọn thư mục")
+        self.select_folder_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        self.select_folder_btn.clicked.connect(self.select_output_folder)
+        output_layout.addWidget(self.select_folder_btn)
+        
+        output_group.setLayout(output_layout)
+        left_layout.addWidget(output_group, 0)
+        
+        # Sync button
+        self.sync_btn = QPushButton("Bắt đầu Đồng bộ")
+        self.sync_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                border: none;
+                padding: 12px;
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.sync_btn.clicked.connect(self.start_sync)
+        left_layout.addWidget(self.sync_btn, 0)
+        
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setMaximumHeight(40)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #e0e0e0;
+                border-radius: 6px;
+                text-align: center;
+                font-weight: bold;
+                font-family: "Open Sans";
+                font-size: 12px;
+                background-color: #f5f5f5;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #9C27B0, stop:1 #7B1FA2);
+                border-radius: 4px;
+            }
+        """)
+        left_layout.addWidget(self.progress_bar, 0)
+        
+        left_panel.setLayout(left_layout)
+        
+        # Panel phải - Log
+        right_panel = QWidget()
+        right_layout = QVBoxLayout()
+        
+        log_label = QLabel("Nhật ký")
+        log_label.setStyleSheet("font-weight: bold;")
+        right_layout.addWidget(log_label)
+        
+        self.log_text = QTextBrowser()
+        self.log_text.setStyleSheet("""
+            QTextBrowser {
+                background-color: #1e1e1e;
+                color: #ffffff;
+                border: 1px solid #404040;
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                font-size: 12px;
+                padding: 8px;
+                border-radius: 4px;
+            }
+            QTextBrowser QScrollBar:vertical {
+                background-color: #2d2d2d;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QTextBrowser QScrollBar::handle:vertical {
+                background-color: #555555;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QTextBrowser QScrollBar::handle:vertical:hover {
+                background-color: #777777;
+            }
+            QTextBrowser QScrollBar::add-line:vertical,
+            QTextBrowser QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        right_layout.addWidget(self.log_text)
+        
+        right_panel.setLayout(right_layout)
+        
+        # Thêm panels vào splitter
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([400, 300])
+        
+        sync_layout.addWidget(splitter)
+        sync_group.setLayout(sync_layout)
+        
+        layout.addWidget(sync_group)
+        self.setLayout(layout)
+        
+        # Biến lưu trữ
+        self.sync_thread = None
+    
+    def load_accounts(self):
+        """Load danh sách tài khoản"""
+        self.account_combo.clear()
+        
+        try:
+            if os.path.exists('cookies.json'):
+                with open('cookies.json', 'r', encoding='utf-8') as f:
+                    cookies_data = json.load(f)
+                
+                for account_name, data in cookies_data.items():
+                    if data.get('validated', False):
+                        email = data.get('user_info', {}).get('email', 'N/A')
+                        display_text = f"{account_name} ({email})"
+                        self.account_combo.addItem(display_text, account_name)
+        except Exception as e:
+            self.log_message(f"Lỗi khi load tài khoản: {str(e)}")
+    
+    def select_image(self):
+        """Chọn ảnh gốc"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn ảnh gốc", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.gif)")
+        
+        if file_path:
+            self.selected_image_path = file_path
+            self.image_path_label.setText(os.path.basename(file_path))
+            self.image_path_label.setStyleSheet("color: black;")
+            self.upload_btn.setEnabled(True)
+            self.log_message(f"📁 Đã chọn ảnh: {os.path.basename(file_path)}")
+    
+    def upload_image(self):
+        """Upload ảnh để lấy MediaGenerationId"""
+        if not self.selected_image_path:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn ảnh trước")
+            return
+        
+        if self.account_combo.count() == 0:
+            QMessageBox.warning(self, "Lỗi", "Chưa có tài khoản nào")
+            return
+        
+        # Lấy thông tin tài khoản
+        account_name = self.account_combo.currentData()
+        try:
+            with open('cookies.json', 'r', encoding='utf-8') as f:
+                cookies_data = json.load(f)
+            
+            if account_name not in cookies_data:
+                QMessageBox.warning(self, "Lỗi", "Tài khoản không tồn tại")
+                return
+            
+            cookie_data = cookies_data[account_name]
+            cookie = cookie_data['cookie']
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Không thể đọc thông tin tài khoản: {str(e)}")
+            return
+        
+        # Disable button và hiện progress
+        self.upload_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        
+        # Tạo thread để upload
+        self.upload_thread = ImageUploadThread(cookie, self.selected_image_path)
+        self.upload_thread.progress.connect(self.log_message)
+        self.upload_thread.finished.connect(self.on_upload_finished)
+        self.upload_thread.start()
+    
+    def on_upload_finished(self, success, message, media_generation_id, raw_bytes):
+        """Xử lý khi hoàn thành upload"""
+        self.upload_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        
+        if success:
+            self.media_generation_id = media_generation_id
+            self.raw_bytes = raw_bytes
+            self.upload_status_label.setText(f"✅ Upload thành công: {media_generation_id[:20]}...")
+            self.upload_status_label.setStyleSheet("color: green; font-size: 12px;")
+            QMessageBox.information(self, "Thành công", message)
+        else:
+            self.upload_status_label.setText("❌ Upload thất bại")
+            self.upload_status_label.setStyleSheet("color: red; font-size: 12px;")
+            QMessageBox.warning(self, "Lỗi", message)
+    
+    def select_excel_file(self):
+        """Chọn file Excel"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file Excel", "", "Excel Files (*.xlsx *.xls)")
+        
+        if file_path:
+            self.selected_excel_path = file_path
+            self.excel_path_label.setText(os.path.basename(file_path))
+            self.excel_path_label.setStyleSheet("color: black;")
+            
+            # Preview Excel data
+            self.preview_excel_data(file_path)
+    
+    def preview_excel_data(self, file_path):
+        """Preview dữ liệu Excel"""
+        try:
+            import pandas as pd
+            
+            df = pd.read_excel(file_path)
+            
+            if len(df.columns) >= 2:
+                stt_list = df.iloc[:, 0].tolist()
+                prompt_list = df.iloc[:, 1].tolist()
+                
+                preview_text = f"📊 Đã đọc {len(stt_list)} dòng dữ liệu"
+                self.excel_preview_label.setText(preview_text)
+                
+                # Hiển thị trong table (2 cột: STT, PROMPT)
+                self.excel_table.setColumnCount(2)
+                self.excel_table.setHorizontalHeaderLabels(["STT", "PROMPT"])
+                self.excel_table.setRowCount(len(stt_list))
+                
+                for i, (stt, prompt) in enumerate(zip(stt_list, prompt_list)):
+                    # STT
+                    stt_item = QTableWidgetItem(str(stt))
+                    stt_item.setTextAlignment(Qt.AlignCenter)
+                    self.excel_table.setItem(i, 0, stt_item)
+                    
+                    # Prompt
+                    prompt_item = QTableWidgetItem(str(prompt))
+                    self.excel_table.setItem(i, 1, prompt_item)
+            else:
+                preview_text = "❌ File Excel cần có ít nhất 2 cột: STT, PROMPT"
+                self.excel_preview_label.setText(preview_text)
+                self.excel_preview_label.setStyleSheet("color: red; font-size: 12px;")
+                self.excel_table.setRowCount(0)
+            
+        except Exception as e:
+            self.excel_preview_label.setText(f"❌ Lỗi khi đọc file Excel: {str(e)}")
+            self.excel_preview_label.setStyleSheet("color: red; font-size: 12px;")
+            self.excel_table.setRowCount(0)
+    
+    def select_output_folder(self):
+        """Chọn thư mục lưu ảnh"""
+        folder_path = QFileDialog.getExistingDirectory(
+            self, 
+            "Chọn thư mục lưu ảnh",
+            "",
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        
+        if folder_path:
+            self.output_folder_path = folder_path
+            folder_name = os.path.basename(folder_path)
+            if len(folder_path) > 50:
+                display_path = f"...{folder_path[-47:]}"
+            else:
+                display_path = folder_path
+            
+            self.output_folder_label.setText(display_path)
+            self.output_folder_label.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            self.log_message(f"📁 Đã chọn thư mục lưu ảnh: {folder_path}")
+    
+    def log_message(self, message):
+        """Thêm message vào log với màu sắc"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        
+        # Xác định màu sắc dựa trên nội dung message
+        if "✅" in message or "thành công" in message.lower():
+            color = "#4CAF50"  # Xanh lá
+        elif "❌" in message or "lỗi" in message.lower() or "error" in message.lower():
+            color = "#F44336"  # Đỏ
+        elif "⚠️" in message or "cảnh báo" in message.lower() or "warning" in message.lower():
+            color = "#FF9800"  # Cam
+        elif "🔧" in message or "hướng dẫn" in message.lower():
+            color = "#2196F3"  # Xanh dương
+        elif "📊" in message or "thống kê" in message.lower():
+            color = "#9C27B0"  # Tím
+        elif "🔄" in message or "đang" in message.lower():
+            color = "#00BCD4"  # Cyan
+        else:
+            color = "#FFFFFF"  # Trắng mặc định
+        
+        # Tạo HTML với màu sắc
+        html_message = f'<span style="color: {color};">[{timestamp}] {message}</span>'
+        self.log_text.append(html_message)
+        
+        # Scroll xuống cuối
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
+    
+    def start_sync(self):
+        """Bắt đầu đồng bộ"""
+        # Kiểm tra dữ liệu đầu vào
+        if self.account_combo.count() == 0:
+            QMessageBox.warning(self, "Lỗi", "Chưa có tài khoản nào")
+            return
+        
+        if not self.media_generation_id or not self.raw_bytes:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng upload ảnh trước")
+            return
+        
+        if not self.selected_excel_path:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn file Excel")
+            return
+        
+        if not self.output_folder_path:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn thư mục lưu ảnh")
+            return
+        
+        # Lấy thông tin tài khoản
+        account_name = self.account_combo.currentData()
+        try:
+            with open('cookies.json', 'r', encoding='utf-8') as f:
+                cookies_data = json.load(f)
+            
+            if account_name not in cookies_data:
+                QMessageBox.warning(self, "Lỗi", "Tài khoản không tồn tại")
+                return
+            
+            cookie_data = cookies_data[account_name]
+            cookie = cookie_data['cookie']
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Không thể đọc thông tin tài khoản: {str(e)}")
+            return
+        
+        # Disable button và hiện progress
+        self.sync_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        
+        # Tạo thread để sync
+        self.sync_thread = SyncThread(
+            cookie, self.media_generation_id, self.raw_bytes, 
+            self.selected_excel_path, self.seed_spinbox.value(), 
+            self.thread_spinbox.value(), self.output_folder_path
+        )
+        
+        self.sync_thread.progress.connect(self.log_message)
+        self.sync_thread.finished.connect(self.on_sync_finished)
+        self.sync_thread.start()
+    
+    def on_sync_finished(self, success, message):
+        """Xử lý khi hoàn thành đồng bộ"""
+        self.sync_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        
+        if success:
+            QMessageBox.information(self, "Thành công", message)
+        else:
+            QMessageBox.warning(self, "Lỗi", message)
+
+
+class ImageUploadThread(QThread):
+    """Thread để upload ảnh"""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, str, str)  # success, message, media_generation_id, raw_bytes
+    
+    def __init__(self, cookie, image_path):
+        super().__init__()
+        self.cookie = cookie
+        self.image_path = image_path
+    
+    def run(self):
+        try:
+            self.progress.emit("Đang upload ảnh lên Google Labs...")
+            
+            # Upload ảnh
+            upload_data = upload_image_to_google_labs(self.cookie, self.image_path)
+            
+            if upload_data:
+                self.progress.emit("✅ Upload ảnh thành công!")
+                
+                # Đọc ảnh và chuyển thành base64
+                import base64
+                with open(self.image_path, 'rb') as image_file:
+                    image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                    raw_bytes = f"data:image/jpeg;base64,{image_data}"
+                
+                self.finished.emit(True, "Upload ảnh thành công", upload_data['uploadMediaGenerationId'], raw_bytes)
+            else:
+                self.progress.emit("❌ Upload ảnh thất bại")
+                self.finished.emit(False, "Upload ảnh thất bại", "", "")
+                
+        except Exception as e:
+            self.progress.emit(f"❌ Lỗi khi upload: {str(e)}")
+            self.finished.emit(False, f"Lỗi khi upload: {str(e)}", "", "")
+
+
+class SyncThread(QThread):
+    """Thread để đồng bộ"""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+    
+    def __init__(self, cookie, media_generation_id, raw_bytes, excel_path, seed, thread_count, output_folder):
+        super().__init__()
+        self.cookie = cookie
+        self.media_generation_id = media_generation_id
+        self.raw_bytes = raw_bytes
+        self.excel_path = excel_path
+        self.seed = seed
+        self.thread_count = thread_count
+        self.output_folder = output_folder
+    
+    def run(self):
+        try:
+            import pandas as pd
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            # Đọc dữ liệu Excel
+            self.progress.emit("Đang đọc file Excel...")
+            
+            df = pd.read_excel(self.excel_path)
+            if len(df.columns) < 2:
+                self.finished.emit(False, "File Excel cần có ít nhất 2 cột: STT, PROMPT")
+                return
+            
+            stt_list = df.iloc[:, 0].tolist()
+            prompt_list = df.iloc[:, 1].tolist()
+            
+            # Validate dữ liệu
+            valid_data = []
+            for i, (stt, prompt) in enumerate(zip(stt_list, prompt_list)):
+                if str(prompt).strip() and str(prompt).strip().lower() != 'nan':
+                    valid_data.append((stt, prompt))
+            
+            if not valid_data:
+                self.finished.emit(False, "Không có dữ liệu hợp lệ trong file Excel")
+                return
+            
+            self.progress.emit(f"✅ Đã đọc {len(valid_data)} dòng dữ liệu từ Excel")
+            self.progress.emit(f"Bắt đầu edit ảnh với {self.thread_count} luồng...")
+            
+            # Tạo danh sách tasks
+            tasks = []
+            for i, (stt, prompt) in enumerate(valid_data):
+                task_data = (stt, prompt, self.cookie, self.media_generation_id, 
+                           self.raw_bytes, self.seed + i, self.output_folder)
+                tasks.append(task_data)
+            
+            success_count = 0
+            
+            # Sử dụng ThreadPoolExecutor để xử lý multi-threading
+            with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
+                future_to_task = {}
+                for task in tasks:
+                    future_to_task[executor.submit(self.process_single_sync_task, task)] = task
+                
+                # Xử lý kết quả khi hoàn thành
+                for future in as_completed(future_to_task):
+                    task = future_to_task[future]
+                    stt = task[0]
+                    
+                    try:
+                        result = future.result()
+                        if result:
+                            self.progress.emit(f"✅ Hoàn thành STT {stt}")
+                            success_count += 1
+                        else:
+                            self.progress.emit(f"❌ Lỗi STT {stt}")
+                    except Exception as e:
+                        self.progress.emit(f"❌ Exception STT {stt}: {str(e)}")
+            
+            if success_count > 0:
+                self.finished.emit(True, f"Đồng bộ thành công {success_count}/{len(valid_data)} ảnh trong thư mục '{self.output_folder}'")
+            else:
+                self.finished.emit(False, "Không edit được ảnh nào")
+                
+        except Exception as e:
+            self.finished.emit(False, f"Lỗi: {str(e)}")
+    
+    def process_single_sync_task(self, task_data):
+        """Xử lý một task edit ảnh trong thread"""
+        stt, prompt, cookie, media_generation_id, raw_bytes, seed, output_folder = task_data
+        
+        try:
+            # Gọi API edit image
+            result = edit_image_with_prompt(cookie, media_generation_id, raw_bytes, prompt, seed)
+            
+            if result and 'imagePanels' in result:
+                for panel in result['imagePanels']:
+                    if 'generatedImages' in panel:
+                        for img in panel['generatedImages']:
+                            if 'encodedImage' in img:
+                                filename = sanitize_filename(stt, prompt)
+                                self.progress.emit(f"💾 Đang lưu ảnh: {filename}")
+                                if save_base64_image(img['encodedImage'], filename, output_folder):
+                                    self.progress.emit(f"✅ Đã lưu thành công: {filename}")
+                                    return True
+                                else:
+                                    self.progress.emit(f"❌ Lỗi khi lưu: {filename}")
+                                    return False
+            return False
+            
+        except Exception as e:
+            self.progress.emit(f"❌ Exception trong process_single_sync_task: {str(e)}")
+            return False
+
+
 class MainWindow(QMainWindow):
     """Cửa sổ chính"""
     
@@ -1847,8 +2560,13 @@ class MainWindow(QMainWindow):
         self.image_tab = ImageGenerationTab()
         self.tab_widget.addTab(self.image_tab, "Tạo Ảnh")
         
+        # Tab đồng bộ
+        self.sync_tab = SyncTab()
+        self.tab_widget.addTab(self.sync_tab, "Đồng bộ")
+        
         # Kết nối signal để cập nhật danh sách tài khoản khi có thay đổi
         self.account_tab.account_updated.connect(self.image_tab.load_accounts)
+        self.account_tab.account_updated.connect(self.sync_tab.load_accounts)
         
         # Styling tab widget
         self.tab_widget.setStyleSheet("""

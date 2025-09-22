@@ -367,67 +367,6 @@ def read_cookie():
     with open('cookie.txt', 'r', encoding='utf-8') as f:
         return f.read().strip()
 
-def read_proxy():
-    """Đọc proxy từ file proxy.txt"""
-    try:
-        with open('proxy.txt', 'r', encoding='utf-8') as f:
-            proxy_line = f.read().strip()
-            if not proxy_line:
-                return None
-            
-            # Format: ip:port:username:password
-            parts = proxy_line.split(':')
-            if len(parts) == 4:
-                ip, port, username, password = parts
-                proxy_url = f"http://{username}:{password}@{ip}:{port}"
-                return {
-                    'http': proxy_url,
-                    'https': proxy_url
-                }
-            else:
-                log_error("Format proxy không đúng. Cần: ip:port:username:password")
-                return None
-    except FileNotFoundError:
-        log_warning("Không tìm thấy file proxy.txt")
-        return None
-    except Exception as e:
-        log_error(f"Lỗi khi đọc proxy: {e}")
-        return None
-
-def test_proxy_connection(proxy_config):
-    """Test kết nối proxy"""
-    if not proxy_config:
-        log_info("Không có proxy để test")
-        return True
-    
-    log_info("🔍 Đang test kết nối proxy...")
-    test_urls = [
-        "http://httpbin.org/ip",
-        "https://httpbin.org/ip",
-        "https://www.google.com"
-    ]
-    
-    for url in test_urls:
-        try:
-            log_info(f"  - Test URL: {url}")
-            response = requests.get(url, proxies=proxy_config, timeout=10)
-            if response.status_code == 200:
-                log_success(f"  ✓ Proxy hoạt động với {url}")
-                if "httpbin.org" in url:
-                    log_info(f"    IP hiện tại: {response.json().get('origin', 'Unknown')}")
-                return True
-            else:
-                log_warning(f"  ⚠ Proxy trả về status {response.status_code} với {url}")
-        except requests.exceptions.ProxyError as e:
-            log_error(f"  ✗ Lỗi proxy với {url}: {e}")
-        except requests.exceptions.Timeout as e:
-            log_error(f"  ✗ Timeout với {url}: {e}")
-        except Exception as e:
-            log_error(f"  ✗ Lỗi khác với {url}: {e}")
-    
-    log_error("Proxy không hoạt động với bất kỳ URL nào")
-    return False
-
 def get_access_token(cookie):
     """Lấy access_token từ Google Labs API"""
     url = "https://labs.google/fx/api/auth/session"
@@ -670,11 +609,24 @@ def generate_image(access_token, prompt, seed, aspect_ratio="IMAGE_ASPECT_RATIO_
                     return None
             elif response.status_code >= 500:
                 log_error(f"Lỗi server (5xx): {response.status_code}")
+                log_error("🔧 Các nguyên nhân có thể:")
+                log_error("  - Server Google Labs đang gặp sự cố")
+                log_error("  - Payload không đúng format")
+                log_error("  - MediaGenerationId không hợp lệ")
+                log_error("  - RawBytes bị lỗi format")
+                log_error("  - Prompt quá dài hoặc chứa ký tự đặc biệt")
+                
                 if attempt < max_retries - 1:
-                    log_warning("Server Google Labs có thể đang gặp sự cố, thử lại...")
+                    wait_time = 10 * (attempt + 1)  # Tăng thời gian chờ cho lỗi 500
+                    log_warning(f"Chờ {wait_time} giây rồi thử lại...")
+                    time.sleep(wait_time)
                     continue
                 else:
-                    log_error("Server Google Labs có thể đang gặp sự cố")
+                    log_error("💡 Hướng dẫn khắc phục:")
+                    log_error("  1. Kiểm tra lại ảnh gốc có hợp lệ không")
+                    log_error("  2. Thử với prompt ngắn hơn")
+                    log_error("  3. Upload lại ảnh để lấy MediaGenerationId mới")
+                    log_error("  4. Thử với tài khoản khác")
                     return None
             else:
                 log_error(f"Lỗi HTTP không xác định: {response.status_code}")
@@ -930,6 +882,186 @@ def generate_image_from_image(access_token, upload_data, user_instruction, seed,
         spinner.stop()
         log_error(f"Lỗi khi tạo ảnh từ ảnh: {e}")
         return None
+
+def validate_edit_payload(original_media_generation_id, raw_bytes, prompt):
+    """Validate payload trước khi gửi API"""
+    errors = []
+    
+    if not original_media_generation_id:
+        errors.append("MediaGenerationId không được để trống")
+    elif len(original_media_generation_id) < 10:
+        errors.append("MediaGenerationId quá ngắn")
+    
+    if not raw_bytes:
+        errors.append("RawBytes không được để trống")
+    elif not raw_bytes.startswith("data:image/"):
+        errors.append("RawBytes phải bắt đầu với 'data:image/'")
+    elif len(raw_bytes) < 1000:
+        errors.append("RawBytes quá ngắn")
+    
+    if not prompt or not prompt.strip():
+        errors.append("Prompt không được để trống")
+    elif len(prompt) > 1000:
+        errors.append("Prompt quá dài (>1000 ký tự)")
+    
+    return errors
+
+def edit_image_with_prompt(cookie, original_media_generation_id, raw_bytes, prompt, seed=None, max_retries=3):
+    """Gọi API backbone.editImage để edit ảnh với prompt"""
+    url = "https://labs.google/fx/api/trpc/backbone.editImage"
+    
+    headers = browser_sim.get_api_headers(cookie=cookie)
+    
+    # Validation đầu vào
+    validation_errors = validate_edit_payload(original_media_generation_id, raw_bytes, prompt)
+    if validation_errors:
+        for error in validation_errors:
+            log_error(f"❌ Validation error: {error}")
+        return None
+    
+    # Tạo UUID cho workflowId và sessionId
+    workflow_id = str(uuid.uuid4())  # Random workflow ID
+    session_id = f";{uuid.uuid4().int}"  # Random session ID
+    
+    for attempt in range(max_retries):
+        payload = {
+            "json": {
+                "clientContext": {
+                    "workflowId": workflow_id,
+                    "tool": "BACKBONE",
+                    "sessionId": session_id
+                },
+                "imageModelSettings": {
+                    "imageModel": "GEM_PIX",
+                    "aspectRatio": None
+                },
+                "flags": {},
+                "editInput": {
+                    "caption": prompt,
+                    "userInstruction": prompt,
+                    "seed": seed,
+                    "safetyMode": None,
+                    "originalMediaGenerationId": original_media_generation_id,
+                    "mediaInput": {
+                        "mediaCategory": "MEDIA_CATEGORY_BOARD",
+                        "rawBytes": raw_bytes
+                    }
+                }
+            },
+            "meta": {
+                "values": {
+                    "imageModelSettings.aspectRatio": ["undefined"],
+                    "editInput.seed": ["undefined"],
+                    "editInput.safetyMode": ["undefined"]
+                }
+            }
+        }
+        
+        
+        # Hiển thị loading spinner
+        if attempt == 0:
+            spinner = LoadingSpinner("Đang edit ảnh với AI...", Fore.MAGENTA)
+        else:
+            spinner = LoadingSpinner(f"Đang edit ảnh với AI... (Thử lại lần {attempt + 1})", Fore.MAGENTA)
+        spinner.start()
+        
+        try:
+            if attempt > 0:
+                log_info(f"🔄 Thử lại lần {attempt + 1}/{max_retries}")
+                # Delay trước khi retry
+                time.sleep(2 * attempt)
+            
+    
+            
+            response = browser_sim.make_request("POST", url, headers=headers, json=payload)
+            spinner.stop()
+            
+            if response is None:
+                log_error("API trả về None - không có kết quả")
+                if attempt < max_retries - 1:
+                    log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                    continue
+                else:
+                    return None
+            
+
+            # Log chi tiết hơn cho lỗi 500
+            if response.status_code == 500:
+                log_error(f"🔍 Chi tiết lỗi 500:")
+              
+            
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                    log_debug(f"🔍 JSON response:")
+                    log_debug(f"  - Response keys: {list(result.keys()) if result else 'None'}")
+                    if 'result' in result and 'data' in result['result']:
+                        data = result['result']['data']['json']
+                        if 'result' in data and 'imagePanels' in data['result']:
+                            log_debug(f"  - imagePanels count: {len(data['result']['imagePanels'])}")
+                            return data['result']
+                    return result
+                except Exception as json_error:
+                    log_error(f"Lỗi parse JSON: {json_error}")
+                    log_error(f"Response text gốc: {response.text}")
+                    if attempt < max_retries - 1:
+                        log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                        continue
+                    return None
+            elif response.status_code == 401:
+                log_error("Lỗi xác thực (401) - Cookie có thể đã hết hạn")
+                return None
+            elif response.status_code == 403:
+                log_error("Lỗi quyền truy cập (403) - Có thể bị chặn bởi Google")
+                if attempt < max_retries - 1:
+                    log_warning("Thử đổi proxy hoặc User-Agent và thử lại...")
+                    continue
+                else:
+                    return None
+            elif response.status_code == 429:
+                log_error("Quá nhiều request (429) - Bị rate limit")
+                if attempt < max_retries - 1:
+                    wait_time = 5 * (attempt + 1)
+                    log_warning(f"Chờ {wait_time} giây rồi thử lại...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return None
+            elif response.status_code >= 500:
+                log_error(f"Lỗi server (5xx): {response.status_code}")
+
+                
+                if attempt < max_retries - 1:
+                    wait_time = 10 * (attempt + 1)  # Tăng thời gian chờ cho lỗi 500
+                    log_warning(f"Chờ {wait_time} giây rồi thử lại...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return None
+            else:
+                log_error(f"Lỗi HTTP không xác định: {response.status_code}")
+                log_error(f"Response text: {response.text}")
+                if attempt < max_retries - 1:
+                    log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                    continue
+                return None
+        except requests.exceptions.Timeout:
+            spinner.stop()
+            log_error("Timeout khi edit ảnh")
+            if attempt < max_retries - 1:
+                log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                continue
+            return None
+        except Exception as e:
+            spinner.stop()
+            log_error(f"Lỗi khi edit ảnh: {e}")
+            if attempt < max_retries - 1:
+                log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                continue
+            return None
+    
+    log_error(f"Đã thử {max_retries} lần nhưng vẫn thất bại")
+    return None
 
 def sanitize_filename(stt_value, prompt_text, max_prompt_length=80):
     """Tạo tên file an toàn cho Windows: STT_PROMPT.jpg"""
