@@ -2046,8 +2046,8 @@ class SyncTab(QWidget):
         # Sync button
         self.sync_btn = QPushButton("Bắt đầu Đồng bộ")
         self.sync_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #9C27B0;
+           QPushButton {
+                background-color: #2196F3;
                 color: white;
                 border: none;
                 padding: 12px;
@@ -2056,7 +2056,7 @@ class SyncTab(QWidget):
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #7B1FA2;
+                background-color: #1976D2;
             }
             QPushButton:disabled {
                 background-color: #cccccc;
@@ -2070,7 +2070,7 @@ class SyncTab(QWidget):
         self.progress_bar.setVisible(False)
         self.progress_bar.setMaximumHeight(40)
         self.progress_bar.setStyleSheet("""
-            QProgressBar {
+          QProgressBar {
                 border: 2px solid #e0e0e0;
                 border-radius: 6px;
                 text-align: center;
@@ -2081,7 +2081,7 @@ class SyncTab(QWidget):
             }
             QProgressBar::chunk {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #9C27B0, stop:1 #7B1FA2);
+                    stop:0 #4CAF50, stop:1 #45a049);
                 border-radius: 4px;
             }
         """)
@@ -2612,7 +2612,7 @@ class MainWindow(QMainWindow):
         """Hiển thị thông tin về ứng dụng"""
         QMessageBox.about(self, "Giới thiệu", 
                          "Whisk Cookie - AI Image Generator\n\n"
-                         "Ứng dụng tạo ảnh AI sử dụng Google Labs Whisk\n"
+                         "Ứng dụng tạo ảnh AI sử dụng Google Labs\n"
                          "Phiên bản: 1.0\n"
                          "Phát triển bởi: @huyit32")
 
