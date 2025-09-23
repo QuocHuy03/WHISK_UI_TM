@@ -1843,7 +1843,7 @@ class SyncTab(QWidget):
         layout = QVBoxLayout()
         
         # Sync Group Box
-        sync_group = QGroupBox("Đồng bộ Ảnh")
+        sync_group = QGroupBox("Sync Image")
         sync_layout = QVBoxLayout()
         
         # Splitter để chia 2 phần
@@ -2043,6 +2043,9 @@ class SyncTab(QWidget):
         output_group.setLayout(output_layout)
         left_layout.addWidget(output_group, 0)
         
+        # Action buttons layout
+        action_layout = QHBoxLayout()
+        
         # Sync button
         self.sync_btn = QPushButton("Bắt đầu Đồng bộ")
         self.sync_btn.setStyleSheet("""
@@ -2063,7 +2066,31 @@ class SyncTab(QWidget):
             }
         """)
         self.sync_btn.clicked.connect(self.start_sync)
-        left_layout.addWidget(self.sync_btn, 0)
+        action_layout.addWidget(self.sync_btn)
+        
+        # Reset button
+        self.reset_btn = QPushButton("Reset")
+        self.reset_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                border: none;
+                padding: 12px;
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.reset_btn.clicked.connect(self.reset_sync_tab)
+        action_layout.addWidget(self.reset_btn)
+        
+        left_layout.addLayout(action_layout)
         
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -2390,6 +2417,59 @@ class SyncTab(QWidget):
             QMessageBox.information(self, "Thành công", message)
         else:
             QMessageBox.warning(self, "Lỗi", message)
+    
+    def reset_sync_tab(self):
+        """Reset toàn bộ sync tab về trạng thái ban đầu"""
+        reply = QMessageBox.question(
+            self, 
+            "Xác nhận Reset", 
+            "Bạn có chắc muốn reset toàn bộ tab đồng bộ?\n\n"
+            "Sẽ xóa:\n"
+            "• Ảnh đã chọn\n"
+            "• File Excel đã chọn\n"
+            "• Thư mục output\n"
+            "• Media Generation ID\n"
+            "• Tất cả dữ liệu đã upload\n\n"
+            "⚠️ Hành động này không thể hoàn tác!",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            # Reset các biến
+            self.selected_image_path = None
+            self.selected_excel_path = None
+            self.output_folder_path = None
+            self.media_generation_id = None
+            self.raw_bytes = None
+            
+            # Reset UI
+            self.image_path_label.setText("Chưa chọn ảnh")
+            self.image_path_label.setStyleSheet("color: gray; font-style: italic;")
+            self.upload_btn.setEnabled(False)
+            
+            self.excel_path_label.setText("Chưa chọn file Excel")
+            self.excel_path_label.setStyleSheet("color: gray; font-style: italic;")
+            self.excel_preview_label.setText("")
+            self.excel_table.setRowCount(0)
+            
+            self.output_folder_label.setText("Chưa chọn thư mục")
+            self.output_folder_label.setStyleSheet("color: #666; font-style: italic;")
+            
+            self.upload_status_label.setText("")
+            
+            # Reset settings về mặc định
+            self.seed_spinbox.setValue(0)
+            self.thread_spinbox.setValue(3)
+            
+            # Clear log
+            self.log_text.clear()
+            
+            # Reload accounts
+            self.load_accounts()
+            
+            self.log_message("🔄 Đã reset toàn bộ tab đồng bộ")
+            QMessageBox.information(self, "Thành công", "Đã reset tab đồng bộ về trạng thái ban đầu")
 
 
 class ImageUploadThread(QThread):
