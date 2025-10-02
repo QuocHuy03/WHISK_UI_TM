@@ -598,14 +598,49 @@ def generate_image(access_token, prompt, seed, aspect_ratio="IMAGE_ASPECT_RATIO_
                     log_error("Thử đổi proxy hoặc User-Agent")
                     return None
             elif response.status_code == 429:
-                log_error("Quá nhiều request (429) - Bị rate limit")
+                # Parse error details from response
+                error_details = ""
+                try:
+                    error_data = response.json()
+                    if 'error' in error_data:
+                        error_info = error_data['error']
+                        error_code = error_info.get('code', 'Unknown')
+                        error_message = error_info.get('message', 'Unknown error')
+                        error_status = error_info.get('status', 'Unknown')
+                        
+                        # Check for specific error types
+                        if error_status == "RESOURCE_EXHAUSTED":
+                            log_error("🚫 Tài nguyên đã cạn kiệt - Quota đã hết")
+                            log_error("💡 Hướng dẫn: Chờ một lúc rồi thử lại hoặc sử dụng tài khoản khác")
+                        elif "PUBLIC_ERROR_USER_REQUESTS_THROTTLED" in str(error_info.get('details', [])):
+                            log_error("⏰ Quá nhiều request - Bị giới hạn tốc độ")
+                            log_error("💡 Hướng dẫn: Giảm số luồng hoặc chờ lâu hơn")
+                        else:
+                            log_error(f"Quá nhiều request (429) - {error_message}")
+                        
+                        error_details = f" - {error_message}"
+                    else:
+                        log_error("Quá nhiều request (429) - Bị rate limit")
+                except:
+                    log_error("Quá nhiều request (429) - Bị rate limit")
+                
                 if attempt < max_retries - 1:
-                    wait_time = 5 * (attempt + 1)
-                    log_warning(f"Chờ {wait_time} giây rồi thử lại...")
+                    # Exponential backoff with jitter
+                    base_wait = 10 * (2 ** attempt)  # 10, 20, 40 seconds
+                    jitter = random.uniform(0.5, 1.5)  # Add randomness
+                    wait_time = int(base_wait * jitter)
+                    
+                    log_warning(f"⏳ Chờ {wait_time} giây rồi thử lại... (Lần {attempt + 1}/{max_retries})")
+                    log_warning("💡 Mẹo: Giảm số luồng để tránh bị rate limit")
                     time.sleep(wait_time)
                     continue
                 else:
-                    log_error("Chờ một lúc rồi thử lại")
+                    log_error("❌ Đã thử nhiều lần nhưng vẫn bị rate limit")
+                    log_error("🔧 Các giải pháp:")
+                    log_error("  1. Giảm số luồng xuống 1-2")
+                    log_error("  2. Chờ 5-10 phút rồi thử lại")
+                    log_error("  3. Sử dụng tài khoản khác")
+                    log_error("  4. Kiểm tra proxy có hoạt động tốt không")
                     return None
             elif response.status_code >= 500:
                 log_error(f"Lỗi server (5xx): {response.status_code}")
@@ -775,8 +810,8 @@ def upload_image_to_google_labs(cookie, image_path, caption="A hyperrealistic di
         log_error(f"Lỗi khi upload ảnh: {e}")
         return None
 
-def generate_image_from_multiple_images(access_token, upload_data_list, user_instruction, seed, image_model="IMAGEN_3_5", aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE", output_folder=None):
-    """Tạo ảnh từ nhiều ảnh đã upload"""
+def generate_image_from_multiple_images(access_token, upload_data_list, user_instruction, seed, image_model="IMAGEN_3_5", aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE", output_folder=None, max_retries=3):
+    """Tạo ảnh từ nhiều ảnh đã upload với cơ chế retry"""
     url = "https://aisandbox-pa.googleapis.com/v1/whisk:runImageRecipe"
     
     headers = browser_sim.get_api_headers(access_token=access_token)
@@ -792,28 +827,144 @@ def generate_image_from_multiple_images(access_token, upload_data_list, user_ins
             }
         })
     
-    payload = {
-        "clientContext": {
-            "workflowId": upload_data_list[0]['workflowId'] if upload_data_list else "",
-            "tool": "BACKBONE",
-            "sessionId": upload_data_list[0]['sessionId'] if upload_data_list else ""
-        },
-        "seed": seed,
-        "imageModelSettings": {
-            "imageModel": image_model,
-            "aspectRatio": aspect_ratio
-        },
-        "userInstruction": user_instruction,
-        "recipeMediaInputs": recipe_media_inputs
-    }
+    for attempt in range(max_retries):
+        payload = {
+            "clientContext": {
+                "workflowId": upload_data_list[0]['workflowId'] if upload_data_list else "",
+                "tool": "BACKBONE",
+                "sessionId": upload_data_list[0]['sessionId'] if upload_data_list else ""
+            },
+            "seed": seed,
+            "imageModelSettings": {
+                "imageModel": image_model,
+                "aspectRatio": aspect_ratio
+            },
+            "userInstruction": user_instruction,
+            "recipeMediaInputs": recipe_media_inputs
+        }
+        
+        # Hiển thị loading spinner
+        if attempt == 0:
+            spinner = LoadingSpinner("Đang tạo ảnh từ nhiều ảnh với AI...", Fore.MAGENTA)
+        else:
+            spinner = LoadingSpinner(f"Đang tạo ảnh từ nhiều ảnh với AI... (Thử lại lần {attempt + 1})", Fore.MAGENTA)
+        spinner.start()
+        
+        try:
+            if attempt > 0:
+                log_info(f"🔄 Thử lại lần {attempt + 1}/{max_retries}")
+                # Delay trước khi retry
+                time.sleep(2 * attempt)
+            
+            response = browser_sim.make_request("POST", url, headers=headers, json=payload, timeout=60)
+            spinner.stop()
+            
+            if response is None:
+                log_error("API trả về None - không có kết quả")
+                if attempt < max_retries - 1:
+                    log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                    continue
+                else:
+                    return None
+            
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                    return result
+                except Exception as json_error:
+                    log_error(f"Lỗi parse JSON: {json_error}")
+                    if attempt < max_retries - 1:
+                        log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                        continue
+                    return None
+            elif response.status_code == 401:
+                log_error("Lỗi xác thực (401) - Access token có thể đã hết hạn")
+                return None
+            elif response.status_code == 403:
+                log_error("Lỗi quyền truy cập (403) - Có thể bị chặn bởi Google")
+                if attempt < max_retries - 1:
+                    log_warning("Thử đổi proxy hoặc User-Agent và thử lại...")
+                    continue
+                else:
+                    return None
+            elif response.status_code == 429:
+                # Parse error details from response
+                error_details = ""
+                try:
+                    error_data = response.json()
+                    if 'error' in error_data:
+                        error_info = error_data['error']
+                        error_code = error_info.get('code', 'Unknown')
+                        error_message = error_info.get('message', 'Unknown error')
+                        error_status = error_info.get('status', 'Unknown')
+                        
+                        # Check for specific error types
+                        if error_status == "RESOURCE_EXHAUSTED":
+                            log_error("🚫 Tài nguyên đã cạn kiệt - Quota đã hết")
+                            log_error("💡 Hướng dẫn: Chờ một lúc rồi thử lại hoặc sử dụng tài khoản khác")
+                        elif "PUBLIC_ERROR_USER_REQUESTS_THROTTLED" in str(error_info.get('details', [])):
+                            log_error("⏰ Quá nhiều request - Bị giới hạn tốc độ")
+                            log_error("💡 Hướng dẫn: Giảm số luồng hoặc chờ lâu hơn")
+                        else:
+                            log_error(f"Quá nhiều request (429) - {error_message}")
+                        
+                        error_details = f" - {error_message}"
+                    else:
+                        log_error("Quá nhiều request (429) - Bị rate limit")
+                except:
+                    log_error("Quá nhiều request (429) - Bị rate limit")
+                
+                if attempt < max_retries - 1:
+                    # Exponential backoff with jitter
+                    base_wait = 10 * (2 ** attempt)  # 10, 20, 40 seconds
+                    jitter = random.uniform(0.5, 1.5)  # Add randomness
+                    wait_time = int(base_wait * jitter)
+                    
+                    log_warning(f"⏳ Chờ {wait_time} giây rồi thử lại... (Lần {attempt + 1}/{max_retries})")
+                    log_warning("💡 Mẹo: Giảm số luồng để tránh bị rate limit")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    log_error("❌ Đã thử nhiều lần nhưng vẫn bị rate limit")
+                    log_error("🔧 Các giải pháp:")
+                    log_error("  1. Giảm số luồng xuống 1-2")
+                    log_error("  2. Chờ 5-10 phút rồi thử lại")
+                    log_error("  3. Sử dụng tài khoản khác")
+                    log_error("  4. Kiểm tra proxy có hoạt động tốt không")
+                    return None
+            elif response.status_code >= 500:
+                log_error(f"Lỗi server (5xx): {response.status_code}")
+                if attempt < max_retries - 1:
+                    wait_time = 10 * (attempt + 1)
+                    log_warning(f"Chờ {wait_time} giây rồi thử lại...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return None
+            else:
+                log_error(f"Lỗi HTTP không xác định: {response.status_code}")
+                log_error(f"Response text: {response.text}")
+                if attempt < max_retries - 1:
+                    log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                    continue
+                return None
+        except requests.exceptions.Timeout:
+            spinner.stop()
+            log_error("Timeout khi tạo ảnh từ nhiều ảnh")
+            if attempt < max_retries - 1:
+                log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                continue
+            return None
+        except Exception as e:
+            spinner.stop()
+            log_error(f"Lỗi khi tạo ảnh từ nhiều ảnh: {e}")
+            if attempt < max_retries - 1:
+                log_warning(f"Sẽ thử lại sau {2 * (attempt + 1)} giây...")
+                continue
+            return None
     
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        log_error(f"Lỗi khi tạo ảnh từ nhiều ảnh: {e}")
-        return None
+    log_error(f"Đã thử {max_retries} lần nhưng vẫn thất bại")
+    return None
 
 def generate_image_from_image(access_token, upload_data, user_instruction, seed, image_model="IMAGEN_3_5", aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE"):
     """Tạo ảnh từ ảnh đã upload"""
@@ -1019,13 +1170,49 @@ def edit_image_with_prompt(cookie, original_media_generation_id, raw_bytes, prom
                 else:
                     return None
             elif response.status_code == 429:
-                log_error("Quá nhiều request (429) - Bị rate limit")
+                # Parse error details from response
+                error_details = ""
+                try:
+                    error_data = response.json()
+                    if 'error' in error_data:
+                        error_info = error_data['error']
+                        error_code = error_info.get('code', 'Unknown')
+                        error_message = error_info.get('message', 'Unknown error')
+                        error_status = error_info.get('status', 'Unknown')
+                        
+                        # Check for specific error types
+                        if error_status == "RESOURCE_EXHAUSTED":
+                            log_error("🚫 Tài nguyên đã cạn kiệt - Quota đã hết")
+                            log_error("💡 Hướng dẫn: Chờ một lúc rồi thử lại hoặc sử dụng tài khoản khác")
+                        elif "PUBLIC_ERROR_USER_REQUESTS_THROTTLED" in str(error_info.get('details', [])):
+                            log_error("⏰ Quá nhiều request - Bị giới hạn tốc độ")
+                            log_error("💡 Hướng dẫn: Giảm số luồng hoặc chờ lâu hơn")
+                        else:
+                            log_error(f"Quá nhiều request (429) - {error_message}")
+                        
+                        error_details = f" - {error_message}"
+                    else:
+                        log_error("Quá nhiều request (429) - Bị rate limit")
+                except:
+                    log_error("Quá nhiều request (429) - Bị rate limit")
+                
                 if attempt < max_retries - 1:
-                    wait_time = 5 * (attempt + 1)
-                    log_warning(f"Chờ {wait_time} giây rồi thử lại...")
+                    # Exponential backoff with jitter
+                    base_wait = 10 * (2 ** attempt)  # 10, 20, 40 seconds
+                    jitter = random.uniform(0.5, 1.5)  # Add randomness
+                    wait_time = int(base_wait * jitter)
+                    
+                    log_warning(f"⏳ Chờ {wait_time} giây rồi thử lại... (Lần {attempt + 1}/{max_retries})")
+                    log_warning("💡 Mẹo: Giảm số luồng để tránh bị rate limit")
                     time.sleep(wait_time)
                     continue
                 else:
+                    log_error("❌ Đã thử nhiều lần nhưng vẫn bị rate limit")
+                    log_error("🔧 Các giải pháp:")
+                    log_error("  1. Giảm số luồng xuống 1-2")
+                    log_error("  2. Chờ 5-10 phút rồi thử lại")
+                    log_error("  3. Sử dụng tài khoản khác")
+                    log_error("  4. Kiểm tra proxy có hoạt động tốt không")
                     return None
             elif response.status_code >= 500:
                 log_error(f"Lỗi server (5xx): {response.status_code}")

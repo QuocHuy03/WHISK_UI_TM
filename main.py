@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget,
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from datetime import datetime
+from PIL import Image
 
 from api import (get_access_token, generate_image, 
                 generate_image_from_multiple_images,
@@ -1498,7 +1499,7 @@ class ExcelGenerationThread(QThread):
             if success_count > 0:
                 self.finished.emit(True, f"Tạo thành công {success_count}/{len(excel_data)} ảnh trong thư mục '{self.output_folder}'")
             else:
-                self.finished.emit(False, "Không tạo được ảnh nào - Có thể do access token hết hạn. Vui lòng cập nhật cookie mới.")
+                self.finished.emit(False, "Không tạo được ảnh nào - Có thể do:\n• Access token hết hạn (401)\n• Quá nhiều request - Rate limit (429)\n• Tài nguyên đã cạn kiệt - Quota hết\n\n💡 Hướng dẫn khắc phục:\n1. Vào tab 'Quản lý Tài khoản' -> Chọn tài khoản -> Click 'Checker'\n2. Nếu vẫn lỗi, thêm cookie mới từ Google Labs\n3. Giảm số luồng xuống 1-2 để tránh rate limit\n4. Chờ 5-10 phút rồi thử lại")
                 
         except Exception as e:
             self.finished.emit(False, f"Lỗi: {str(e)}")
@@ -1533,6 +1534,11 @@ class ExcelGenerationThread(QThread):
                                     self.progress.emit(f"❌ Lỗi khi lưu: {filename}")
                                     print(f"❌ Lỗi khi lưu: {filename}")
                                     return False
+            elif result is None:
+                # API trả về None - có thể do lỗi 401, 429, hoặc lỗi khác
+                self.progress.emit(f"❌ Lỗi STT {stt} - API không phản hồi")
+                self.progress.emit("💡 Có thể do: Access token hết hạn (401), Rate limit (429), hoặc Quota hết")
+                return False
             return False
             
         except Exception as e:
@@ -1601,6 +1607,11 @@ class ExcelGenerationThread(QThread):
                                     else:
                                         self.progress.emit(f"❌ Lỗi khi lưu img2img: {filename}")
                                         return False
+                elif result is None:
+                    # API trả về None - có thể do lỗi 401, 429, hoặc lỗi khác
+                    self.progress.emit(f"❌ Lỗi STT {stt} - API không phản hồi (img2img)")
+                    self.progress.emit("💡 Có thể do: Access token hết hạn (401), Rate limit (429), hoặc Quota hết")
+                    return False
             return False
             
         except Exception as e:
@@ -1749,10 +1760,16 @@ class ImageGenerationThread(QThread):
                                         else:
                                             self.progress.emit(f"❌ Lỗi khi lưu: {filename}")
                     elif result is None:
-                        # Nếu result là None, có thể do lỗi 401 (token hết hạn)
-                        self.progress.emit("❌ Lỗi xác thực - Access token có thể đã hết hạn")
-                        self.progress.emit("💡 Hướng dẫn: Vào tab 'Quản lý Tài khoản' -> Chọn tài khoản -> Click 'Checker' để kiểm tra")
-                        self.progress.emit("💡 Nếu vẫn lỗi, hãy thêm cookie mới từ Google Labs")
+                        # Nếu result là None, có thể do lỗi 401 (token hết hạn) hoặc 429 (rate limit)
+                        self.progress.emit("❌ Lỗi khi tạo ảnh - Có thể do:")
+                        self.progress.emit("  • Access token hết hạn (401)")
+                        self.progress.emit("  • Quá nhiều request - Rate limit (429)")
+                        self.progress.emit("  • Tài nguyên đã cạn kiệt - Quota hết")
+                        self.progress.emit("💡 Hướng dẫn khắc phục:")
+                        self.progress.emit("  1. Vào tab 'Quản lý Tài khoản' -> Chọn tài khoản -> Click 'Checker'")
+                        self.progress.emit("  2. Nếu vẫn lỗi, thêm cookie mới từ Google Labs")
+                        self.progress.emit("  3. Giảm số luồng xuống 1-2 để tránh rate limit")
+                        self.progress.emit("  4. Chờ 5-10 phút rồi thử lại")
                         break  # Dừng vòng lặp để tránh spam lỗi
                 
                 elif self.mode == "Image to Image":
@@ -1821,7 +1838,7 @@ class ImageGenerationThread(QThread):
             if success_count > 0:
                 self.finished.emit(True, f"Tạo thành công {success_count} ảnh trong thư mục '{self.output_folder}'")
             else:
-                self.finished.emit(False, "Không tạo được ảnh nào - Có thể do access token hết hạn. Vui lòng cập nhật cookie mới.")
+                self.finished.emit(False, "Không tạo được ảnh nào - Có thể do:\n• Access token hết hạn (401)\n• Quá nhiều request - Rate limit (429)\n• Tài nguyên đã cạn kiệt - Quota hết\n\n💡 Hướng dẫn khắc phục:\n1. Vào tab 'Quản lý Tài khoản' -> Chọn tài khoản -> Click 'Checker'\n2. Nếu vẫn lỗi, thêm cookie mới từ Google Labs\n3. Giảm số luồng xuống 1-2 để tránh rate limit\n4. Chờ 5-10 phút rồi thử lại")
                 
         except Exception as e:
             self.finished.emit(False, f"Lỗi: {str(e)}")
@@ -1837,6 +1854,7 @@ class SyncTab(QWidget):
         self.output_folder_path = None
         self.media_generation_id = None
         self.raw_bytes = None
+        self.failed_tasks = []  # Danh sách các task thất bại
         self.init_ui()
     
     def init_ui(self):
@@ -1917,6 +1935,21 @@ class SyncTab(QWidget):
         self.upload_status_label.setStyleSheet("color: blue; font-size: 12px;")
         self.upload_status_label.setWordWrap(True)
         upload_layout.addWidget(self.upload_status_label)
+        
+        # Aspect ratio selection
+        aspect_layout = QHBoxLayout()
+        aspect_layout.addWidget(QLabel("Tỷ lệ khung hình:"))
+        
+        self.aspect_combo = QComboBox()
+        self.aspect_combo.addItems([
+            "1:1 (Square)", 
+            "16:9 (Landscape)", 
+            "9:16 (Portrait)"
+        ])
+        self.aspect_combo.setCurrentText("16:9 (Landscape)")  # Mặc định
+        aspect_layout.addWidget(self.aspect_combo)
+        
+        upload_layout.addLayout(aspect_layout)
         
         upload_group.setLayout(upload_layout)
         left_layout.addWidget(upload_group)
@@ -2090,6 +2123,29 @@ class SyncTab(QWidget):
         self.reset_btn.clicked.connect(self.reset_sync_tab)
         action_layout.addWidget(self.reset_btn)
         
+        # Retry failed tasks button
+        self.retry_btn = QPushButton("Retry Lỗi")
+        self.retry_btn.setEnabled(False)
+        self.retry_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9C27B0;
+                color: white;
+                border: none;
+                padding: 12px;
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #7B1FA2;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+        """)
+        self.retry_btn.clicked.connect(self.retry_failed_tasks)
+        action_layout.addWidget(self.retry_btn)
+        
         left_layout.addLayout(action_layout)
         
         # Progress bar
@@ -2232,8 +2288,17 @@ class SyncTab(QWidget):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         
+        # Lấy aspect ratio cho resize
+        aspect_text = self.aspect_combo.currentText()
+        if "Square" in aspect_text:
+            aspect_ratio = "1:1"
+        elif "Portrait" in aspect_text:
+            aspect_ratio = "9:16"
+        else:  # Landscape
+            aspect_ratio = "16:9"
+        
         # Tạo thread để upload
-        self.upload_thread = ImageUploadThread(cookie, self.selected_image_path)
+        self.upload_thread = ImageUploadThread(cookie, self.selected_image_path, aspect_ratio)
         self.upload_thread.progress.connect(self.log_message)
         self.upload_thread.finished.connect(self.on_upload_finished)
         self.upload_thread.start()
@@ -2413,6 +2478,79 @@ class SyncTab(QWidget):
         self.sync_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
         
+        # Lưu failed_tasks từ sync_thread
+        if hasattr(self, 'sync_thread') and hasattr(self.sync_thread, 'failed_tasks'):
+            self.failed_tasks = self.sync_thread.failed_tasks.copy()
+            
+            # Kích hoạt nút retry nếu có task thất bại
+            if self.failed_tasks:
+                self.retry_btn.setEnabled(True)
+                self.log_message(f"🔄 Có {len(self.failed_tasks)} ảnh thất bại có thể retry")
+            else:
+                self.retry_btn.setEnabled(False)
+        
+        if success:
+            QMessageBox.information(self, "Thành công", message)
+        else:
+            QMessageBox.warning(self, "Lỗi", message)
+    
+    def retry_failed_tasks(self):
+        """Retry các task thất bại"""
+        if not self.failed_tasks:
+            QMessageBox.warning(self, "Thông báo", "Không có task nào để retry")
+            return
+        
+        if self.account_combo.count() == 0:
+            QMessageBox.warning(self, "Lỗi", "Chưa có tài khoản nào")
+            return
+        
+        # Lấy thông tin tài khoản
+        account_name = self.account_combo.currentData()
+        try:
+            with open('cookies.json', 'r', encoding='utf-8') as f:
+                cookies_data = json.load(f)
+            
+            if account_name not in cookies_data:
+                QMessageBox.warning(self, "Lỗi", "Tài khoản không tồn tại")
+                return
+            
+            cookie_data = cookies_data[account_name]
+            cookie = cookie_data['cookie']
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Lỗi", f"Không thể đọc thông tin tài khoản: {str(e)}")
+            return
+        
+        # Disable button và hiện progress
+        self.retry_btn.setEnabled(False)
+        self.sync_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        
+        # Tạo thread để retry
+        self.retry_thread = RetryThread(
+            cookie, self.media_generation_id, self.raw_bytes, 
+            self.failed_tasks, self.thread_spinbox.value(), self.output_folder_path
+        )
+        
+        self.retry_thread.progress.connect(self.log_message)
+        self.retry_thread.finished.connect(self.on_retry_finished)
+        self.retry_thread.start()
+    
+    def on_retry_finished(self, success, message, new_failed_tasks):
+        """Xử lý khi hoàn thành retry"""
+        self.sync_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        
+        # Cập nhật failed_tasks
+        self.failed_tasks = new_failed_tasks
+        
+        # Kích hoạt nút retry nếu vẫn còn task thất bại
+        if self.failed_tasks:
+            self.retry_btn.setEnabled(True)
+        else:
+            self.retry_btn.setEnabled(False)
+        
         if success:
             QMessageBox.information(self, "Thành công", message)
         else:
@@ -2442,6 +2580,7 @@ class SyncTab(QWidget):
             self.output_folder_path = None
             self.media_generation_id = None
             self.raw_bytes = None
+            self.failed_tasks = []
             
             # Reset UI
             self.image_path_label.setText("Chưa chọn ảnh")
@@ -2462,6 +2601,9 @@ class SyncTab(QWidget):
             self.seed_spinbox.setValue(0)
             self.thread_spinbox.setValue(3)
             
+            # Reset retry button
+            self.retry_btn.setEnabled(False)
+            
             # Clear log
             self.log_text.clear()
             
@@ -2472,29 +2614,131 @@ class SyncTab(QWidget):
             QMessageBox.information(self, "Thành công", "Đã reset tab đồng bộ về trạng thái ban đầu")
 
 
+def check_image_size(image_path, aspect_ratio="16:9"):
+    """
+    Kiểm tra kích thước ảnh có chuẩn không
+    Args:
+        image_path: Đường dẫn ảnh gốc
+        aspect_ratio: Tỷ lệ khung hình ("16:9", "9:16", "1:1")
+    Returns:
+        tuple: (is_correct_size, current_size, target_size)
+    """
+    # Định nghĩa kích thước chuẩn
+    size_mapping = {
+        "16:9": (1408, 768),
+        "9:16": (768, 1408), 
+        "1:1": (1024, 1024)
+    }
+    
+    if aspect_ratio not in size_mapping:
+        aspect_ratio = "16:9"  # Mặc định
+    
+    target_size = size_mapping[aspect_ratio]
+    
+    try:
+        # Mở ảnh gốc
+        with Image.open(image_path) as img:
+            current_size = img.size
+            is_correct = current_size == target_size
+            return is_correct, current_size, target_size
+            
+    except Exception as e:
+        print(f"Lỗi khi kiểm tra kích thước ảnh: {str(e)}")
+        return False, (0, 0), target_size
+
+
+def resize_image_to_standard_size(image_path, aspect_ratio="16:9"):
+    """
+    Resize ảnh theo kích thước chuẩn (chỉ khi cần thiết)
+    Args:
+        image_path: Đường dẫn ảnh gốc
+        aspect_ratio: Tỷ lệ khung hình ("16:9", "9:16", "1:1")
+    Returns:
+        str: Đường dẫn ảnh (gốc nếu đã đúng kích thước, hoặc đã resize)
+    """
+    # Định nghĩa kích thước chuẩn
+    size_mapping = {
+        "16:9": (1408, 768),
+        "9:16": (768, 1408), 
+        "1:1": (1024, 1024)
+    }
+    
+    if aspect_ratio not in size_mapping:
+        aspect_ratio = "16:9"  # Mặc định
+    
+    target_size = size_mapping[aspect_ratio]
+    
+    try:
+        # Kiểm tra kích thước hiện tại
+        is_correct, current_size, target_size = check_image_size(image_path, aspect_ratio)
+        
+        if is_correct:
+            return image_path  # Trả về đường dẫn gốc
+        
+        # Mở ảnh gốc
+        with Image.open(image_path) as img:
+            # Chuyển sang RGB nếu cần
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Resize ảnh với thuật toán LANCZOS để đảm bảo chất lượng
+            resized_img = img.resize(target_size, Image.Resampling.LANCZOS)
+            
+            # Tạo đường dẫn file mới
+            base_name = os.path.splitext(image_path)[0]
+            extension = os.path.splitext(image_path)[1]
+            resized_path = f"{base_name}_resized_{aspect_ratio.replace(':', 'x')}{extension}"
+            
+            # Lưu ảnh đã resize
+            resized_img.save(resized_path, 'JPEG', quality=95)
+            
+            return resized_path
+            
+    except Exception as e:
+        print(f"Lỗi khi resize ảnh: {str(e)}")
+        return image_path  # Trả về đường dẫn gốc nếu có lỗi
+
+
 class ImageUploadThread(QThread):
     """Thread để upload ảnh"""
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str, str, str)  # success, message, media_generation_id, raw_bytes
     
-    def __init__(self, cookie, image_path):
+    def __init__(self, cookie, image_path, aspect_ratio="16:9"):
         super().__init__()
         self.cookie = cookie
         self.image_path = image_path
+        self.aspect_ratio = aspect_ratio
     
     def run(self):
         try:
+            self.progress.emit("🔍 Đang kiểm tra kích thước ảnh...")
+            
+            # Kiểm tra kích thước ảnh trước
+            is_correct, current_size, target_size = check_image_size(self.image_path, self.aspect_ratio)
+            
+            if is_correct:
+                self.progress.emit(f"✅ Ảnh đã đúng kích thước {self.aspect_ratio} ({current_size[0]}x{current_size[1]})")
+                resized_image_path = self.image_path  # Sử dụng ảnh gốc
+            else:
+                self.progress.emit(f"🔄 Ảnh cần resize từ {current_size[0]}x{current_size[1]} thành {target_size[0]}x{target_size[1]}")
+                self.progress.emit("Đang resize ảnh theo kích thước chuẩn...")
+                
+                # Resize ảnh theo kích thước chuẩn
+                resized_image_path = resize_image_to_standard_size(self.image_path, self.aspect_ratio)
+                self.progress.emit(f"✅ Đã resize ảnh thành {target_size[0]}x{target_size[1]}")
+            
             self.progress.emit("Đang upload ảnh lên Google Labs...")
             
-            # Upload ảnh
-            upload_data = upload_image_to_google_labs(self.cookie, self.image_path)
+            # Upload ảnh đã resize
+            upload_data = upload_image_to_google_labs(self.cookie, resized_image_path)
             
             if upload_data:
                 self.progress.emit("✅ Upload ảnh thành công!")
                 
-                # Đọc ảnh và chuyển thành base64
+                # Đọc ảnh đã resize và chuyển thành base64
                 import base64
-                with open(self.image_path, 'rb') as image_file:
+                with open(resized_image_path, 'rb') as image_file:
                     image_data = base64.b64encode(image_file.read()).decode('utf-8')
                     raw_bytes = f"data:image/jpeg;base64,{image_data}"
                 
@@ -2522,6 +2766,7 @@ class SyncThread(QThread):
         self.seed = seed
         self.thread_count = thread_count
         self.output_folder = output_folder
+        self.failed_tasks = []  # Danh sách các task thất bại
     
     def run(self):
         try:
@@ -2560,6 +2805,9 @@ class SyncThread(QThread):
                 tasks.append(task_data)
             
             success_count = 0
+            error_count = 0
+            api_error_count = 0
+            save_error_count = 0
             
             # Sử dụng ThreadPoolExecutor để xử lý multi-threading
             with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
@@ -2571,6 +2819,7 @@ class SyncThread(QThread):
                 for future in as_completed(future_to_task):
                     task = future_to_task[future]
                     stt = task[0]
+                    prompt = task[1]
                     
                     try:
                         result = future.result()
@@ -2578,14 +2827,31 @@ class SyncThread(QThread):
                             self.progress.emit(f"✅ Hoàn thành STT {stt}")
                             success_count += 1
                         else:
-                            self.progress.emit(f"❌ Lỗi STT {stt}")
+                            self.progress.emit(f"❌ Thất bại STT {stt}")
+                            self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+                            error_count += 1
+                            # Lưu task thất bại để retry
+                            self.failed_tasks.append(task)
                     except Exception as e:
                         self.progress.emit(f"❌ Exception STT {stt}: {str(e)}")
+                        self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+                        error_count += 1
+                        # Lưu task thất bại để retry
+                        self.failed_tasks.append(task)
+            
+            # Hiển thị thống kê chi tiết
+            self.progress.emit("📊 THỐNG KÊ KẾT QUẢ:")
+            self.progress.emit(f"✅ Thành công: {success_count}/{len(valid_data)} ảnh")
+            self.progress.emit(f"❌ Thất bại: {error_count}/{len(valid_data)} ảnh")
+            
+            if self.failed_tasks:
+                self.progress.emit(f"🔄 Có {len(self.failed_tasks)} ảnh thất bại có thể retry")
+                self.progress.emit("💡 Nhấn nút 'Retry Lỗi' để chạy lại các ảnh thất bại")
             
             if success_count > 0:
                 self.finished.emit(True, f"Đồng bộ thành công {success_count}/{len(valid_data)} ảnh trong thư mục '{self.output_folder}'")
             else:
-                self.finished.emit(False, "Không edit được ảnh nào")
+                self.finished.emit(False, f"Không edit được ảnh nào. Tổng lỗi: {error_count}")
                 
         except Exception as e:
             self.finished.emit(False, f"Lỗi: {str(e)}")
@@ -2611,10 +2877,136 @@ class SyncThread(QThread):
                                 else:
                                     self.progress.emit(f"❌ Lỗi khi lưu: {filename}")
                                     return False
-            return False
-            
+            elif result is None:
+                # API trả về None - có thể do lỗi 401, 429, hoặc lỗi khác
+                self.progress.emit(f"❌ STT {stt} - API không phản hồi")
+                self.progress.emit(f"💡 Có thể do: Access token hết hạn (401), Rate limit (429), hoặc Quota hết")
+                self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+                return False
+            else:
+                # API trả về dữ liệu không hợp lệ
+                self.progress.emit(f"❌ STT {stt} - Dữ liệu API không hợp lệ")
+                self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+                return False
+                
         except Exception as e:
-            self.progress.emit(f"❌ Exception trong process_single_sync_task: {str(e)}")
+            # Log lỗi chi tiết để debug
+            import traceback
+            self.progress.emit(f"❌ Exception STT {stt}: {str(e)}")
+            self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+            self.progress.emit(f"🔧 Traceback: {traceback.format_exc()}")
+            return False
+
+
+class RetryThread(QThread):
+    """Thread để retry các task thất bại"""
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str, list)  # success, message, new_failed_tasks
+    
+    def __init__(self, cookie, media_generation_id, raw_bytes, failed_tasks, thread_count, output_folder):
+        super().__init__()
+        self.cookie = cookie
+        self.media_generation_id = media_generation_id
+        self.raw_bytes = raw_bytes
+        self.failed_tasks = failed_tasks
+        self.thread_count = thread_count
+        self.output_folder = output_folder
+    
+    def run(self):
+        try:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            self.progress.emit(f"🔄 Bắt đầu retry {len(self.failed_tasks)} ảnh thất bại...")
+            
+            success_count = 0
+            error_count = 0
+            new_failed_tasks = []
+            
+            # Sử dụng ThreadPoolExecutor để xử lý multi-threading
+            with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
+                future_to_task = {}
+                for task in self.failed_tasks:
+                    future_to_task[executor.submit(self.process_single_sync_task, task)] = task
+                
+                # Xử lý kết quả khi hoàn thành
+                for future in as_completed(future_to_task):
+                    task = future_to_task[future]
+                    stt = task[0]
+                    prompt = task[1]
+                    
+                    try:
+                        result = future.result()
+                        if result:
+                            self.progress.emit(f"✅ Retry thành công STT {stt}")
+                            success_count += 1
+                        else:
+                            self.progress.emit(f"❌ Retry thất bại STT {stt}")
+                            self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+                            error_count += 1
+                            new_failed_tasks.append(task)
+                    except Exception as e:
+                        self.progress.emit(f"❌ Exception STT {stt}: {str(e)}")
+                        self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+                        error_count += 1
+                        new_failed_tasks.append(task)
+            
+            # Hiển thị thống kê chi tiết
+            self.progress.emit("📊 THỐNG KÊ RETRY:")
+            self.progress.emit(f"✅ Thành công: {success_count}/{len(self.failed_tasks)} ảnh")
+            self.progress.emit(f"❌ Vẫn thất bại: {error_count}/{len(self.failed_tasks)} ảnh")
+            
+            if new_failed_tasks:
+                self.progress.emit(f"🔄 Còn {len(new_failed_tasks)} ảnh thất bại có thể retry tiếp")
+            else:
+                self.progress.emit("🎉 Đã retry thành công tất cả ảnh!")
+            
+            if success_count > 0:
+                self.finished.emit(True, f"Retry thành công {success_count}/{len(self.failed_tasks)} ảnh", new_failed_tasks)
+            else:
+                self.finished.emit(False, f"Retry thất bại tất cả {len(self.failed_tasks)} ảnh", new_failed_tasks)
+                
+        except Exception as e:
+            self.finished.emit(False, f"Lỗi retry: {str(e)}", self.failed_tasks)
+    
+    def process_single_sync_task(self, task_data):
+        """Xử lý một task edit ảnh trong thread (tái sử dụng từ SyncThread)"""
+        stt, prompt, cookie, media_generation_id, raw_bytes, seed, output_folder = task_data
+        
+        try:
+            # Gọi API edit image
+            result = edit_image_with_prompt(cookie, media_generation_id, raw_bytes, prompt, seed)
+            
+            if result and 'imagePanels' in result:
+                for panel in result['imagePanels']:
+                    if 'generatedImages' in panel:
+                        for img in panel['generatedImages']:
+                            if 'encodedImage' in img:
+                                filename = sanitize_filename(stt, prompt)
+                                self.progress.emit(f"💾 Đang lưu ảnh: {filename}")
+                                if save_base64_image(img['encodedImage'], filename, output_folder):
+                                    self.progress.emit(f"✅ Đã lưu thành công: {filename}")
+                                    return True
+                                else:
+                                    self.progress.emit(f"❌ Lỗi khi lưu: {filename}")
+                                    return False
+            elif result is None:
+                # API trả về None - có thể do lỗi 401, 429, hoặc lỗi khác
+                self.progress.emit(f"❌ STT {stt} - API không phản hồi")
+                self.progress.emit(f"💡 Có thể do: Access token hết hạn (401), Rate limit (429), hoặc Quota hết")
+                self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+                return False
+            else:
+                # API trả về dữ liệu không hợp lệ
+                self.progress.emit(f"❌ STT {stt} - Dữ liệu API không hợp lệ")
+                self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+                return False
+                
+        except Exception as e:
+            # Log lỗi chi tiết để debug
+            import traceback
+            self.progress.emit(f"❌ Exception STT {stt}: {str(e)}")
+            self.progress.emit(f"🔍 Prompt: {prompt[:50]}...")
+            self.progress.emit(f"🔧 Traceback: {traceback.format_exc()}")
             return False
 
 
