@@ -3074,11 +3074,98 @@ class MainWindow(QMainWindow):
         exit_action = file_menu.addAction('Thoát')
         exit_action.triggered.connect(self.close)
         
+        # Settings menu
+        settings_menu = menubar.addMenu('Cài đặt')
+        
+        refresh_key_action = settings_menu.addAction('Làm mới key')
+        refresh_key_action.triggered.connect(self.force_refresh_key)
+        
+        settings_menu.addSeparator()
+        
+        clear_key_action = settings_menu.addAction('Xóa key đã lưu')
+        clear_key_action.triggered.connect(self.clear_saved_key)
+        
         # Help menu
         help_menu = menubar.addMenu('Help')
         
         about_action = help_menu.addAction('Giới thiệu')
         about_action.triggered.connect(self.show_about)
+    
+    def force_refresh_key(self):
+        """Làm mới thông tin key bằng cách kiểm tra với server"""
+        config_manager = ConfigManager()
+        device_id = get_device_id()[0]
+        
+        saved_key, saved_key_info = config_manager.get_saved_api_key(device_id)
+        
+        if not saved_key:
+            QMessageBox.information(self, "Thông báo", 
+                                  "Không có key đã lưu để làm mới.\n"
+                                  "Vui lòng đăng nhập lại.")
+            return
+        
+        # Hiển thị progress dialog
+        progress = QMessageBox(self)
+        progress.setWindowTitle("Đang làm mới key...")
+        progress.setText("Đang kiểm tra key với server...")
+        progress.setStandardButtons(QMessageBox.NoButton)
+        progress.show()
+        
+        # Process events để hiển thị dialog
+        QApplication.processEvents()
+        
+        try:
+            # Kiểm tra key với server
+            success, message, info = check_key_online(saved_key, API_AUTH_ENDPOINT)
+            
+            progress.close()
+            
+            if success:
+                # Cập nhật thông tin key
+                config_manager.save_api_key(saved_key, device_id, info, remember=True)
+                
+                # Cập nhật title window
+                expires = info.get("expires", "Unknown")
+                remaining = info.get("remaining", 0)
+                key_display = saved_key[:8] + "..." if len(saved_key) > 8 else saved_key
+                window_title = f"Whisk AI v{CURRENT_VERSION} - @huyit32 - KEY: {key_display} | Expires: {expires} | Remaining: {remaining}"
+                self.setWindowTitle(window_title)
+                
+                QMessageBox.information(self, "Thành công", 
+                                      f"Đã làm mới thông tin key thành công!\n\n"
+                                      f"Expires: {expires}\n"
+                                      f"Remaining: {remaining}")
+            else:
+                QMessageBox.critical(self, "Key không hợp lệ", 
+                                   f"Key đã lưu không còn hợp lệ:\n{message}\n\n"
+                                   f"Vui lòng đăng nhập lại.")
+                # Xóa key không hợp lệ
+                config_manager.clear_api_key()
+                
+        except Exception as e:
+            progress.close()
+            QMessageBox.warning(self, "Lỗi", 
+                              f"Không thể kiểm tra key với server:\n{str(e)}")
+    
+    def clear_saved_key(self):
+        """Xóa key đã lưu"""
+        reply = QMessageBox.question(self, "Xác nhận", 
+                                   "Bạn có chắc chắn muốn xóa key đã lưu?\n"
+                                   "Lần sau mở app bạn sẽ phải nhập key lại.",
+                                   QMessageBox.Yes | QMessageBox.No,
+                                   QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            config_manager = ConfigManager()
+            success = config_manager.clear_api_key()
+            
+            if success:
+                QMessageBox.information(self, "Thành công", 
+                                      "Đã xóa key đã lưu thành công!\n"
+                                      "Lần sau mở app bạn sẽ phải nhập key lại.")
+            else:
+                QMessageBox.warning(self, "Lỗi", 
+                                  "Không thể xóa key đã lưu. Vui lòng thử lại.")
     
     def show_about(self):
         """Hiển thị thông tin về ứng dụng"""
@@ -3088,8 +3175,9 @@ class MainWindow(QMainWindow):
                          "Phiên bản: 1.0\n"
                          "Phát triển bởi: @huyit32")
 
-from auth.auth_guard import KeyLoginDialog, get_device_id
+from auth.auth_guard import KeyLoginDialog, get_device_id, check_key_online
 from version_checker import check_for_update, CURRENT_VERSION
+from config_manager import ConfigManager
 import sys
 
 # Constants
@@ -3105,22 +3193,69 @@ def main():
     
     # Create main window
     if check_for_update(VERSION_CHECK_ENDPOINT):
-            return 0
+        return 0
+    
+    # Khởi tạo config manager
+    config_manager = ConfigManager()
+    device_id = get_device_id()[0]
+    
+    # Kiểm tra key đã lưu
+    saved_key, saved_key_info = config_manager.get_saved_api_key(device_id)
+    key_info = {}
+    
+    if saved_key and saved_key_info:
+        # Kiểm tra expiry local trước
+        if config_manager.is_key_expired_locally(device_id):
+            print("Key đã hết hạn (kiểm tra local), xóa key cũ...")
+            config_manager.clear_api_key()
+            saved_key = None
+            saved_key_info = None
+        elif config_manager.should_refresh_key(device_id, force_refresh_hours=24):
+            # Key đã lưu lâu (>24h), kiểm tra với server để đảm bảo
+            print("Key đã lưu lâu, đang kiểm tra với server...")
+            success, message, info = check_key_online(saved_key, API_AUTH_ENDPOINT)
             
-        # Authenticate user
-    login_dialog = KeyLoginDialog(API_AUTH_ENDPOINT)
-    if login_dialog.exec_() != QDialog.Accepted or not login_dialog.validated:
+            if success:
+                print("Key vẫn hợp lệ, cập nhật thông tin...")
+                # Cập nhật lại thông tin key với dữ liệu mới từ server
+                config_manager.save_api_key(saved_key, device_id, info, remember=True)
+                key_info = info
+            else:
+                print(f"Key không còn hợp lệ: {message}")
+                config_manager.clear_api_key()
+                saved_key = None
+                saved_key_info = None
+        else:
+            # Key còn "tươi" (<24h), sử dụng thông tin đã lưu
+            print("Sử dụng key đã lưu (không cần kiểm tra server)...")
+            key_info = saved_key_info
+    
+    # Nếu không có key hợp lệ, hiện dialog đăng nhập
+    if not saved_key or not key_info:
+        login_dialog = KeyLoginDialog(API_AUTH_ENDPOINT)
+        if login_dialog.exec_() != QDialog.Accepted or not login_dialog.validated:
             return 0
-            
-        # Get authentication info
-    key_info = login_dialog.key_info
+        
+        # Lấy thông tin từ dialog
+        key_info = login_dialog.key_info
+        remember_key = login_dialog.remember_key
+        
+        # Lưu key nếu user chọn
+        if remember_key:
+            api_key = key_info.get("key")
+            if api_key:
+                success = config_manager.save_api_key(api_key, device_id, key_info, remember=True)
+                if success:
+                    print("Đã lưu key thành công!")
+                else:
+                    print("Không thể lưu key.")
+    
+    # Lấy thông tin key để hiển thị
     key = key_info.get("key")
     expires_raw = key_info.get("expires", "")
     remaining = key_info.get("remaining", 0)
-    device_id = get_device_id()[0]
-        
-        
-        # Create and show main UI
+    
+    # Create and show main UI
     ui = MainWindow()
     expires = expires_raw if expires_raw else "Unknown"
     window_title = f"Whisk AI v{CURRENT_VERSION} - @huyit32 - KEY: {key} | Expires: {expires} | Remaining: {remaining}"
