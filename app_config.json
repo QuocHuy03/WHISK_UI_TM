@@ -1,10 +1,10 @@
 {
   "saved_key": {
-    "encrypted_key": "Z0FBQUFBQm8zaGdIN0RJeGwwc0pJc0lNX3JrWlBFMVJpa2hDdkJhRHR3NUV2NWVtakFBYWRmb3RCdjRtSGx2aV9sRF9ud0U1bEhaY081cGV4VlpadUdZLUhpcDJvb1Z3WGc9PQ==",
-    "device_hash": "01e77085386b8cf0",
-    "saved_at": 1759385607,
+    "encrypted_key": "Z0FBQUFBQm80eDJwbGQ4TWhSRmZIOW9GTTZlcS1MenJWUXJ6M3dVa0tTaEFiU1hNRm95RXZPd0hzcDBaRXBGeVFCWmh3R2Y1cFVub1R4WDRiYWlFak4xOWtEM1ZKRGlKdWc9PQ==",
+    "device_hash": "478a809ae710ec62",
+    "saved_at": 1759714729,
     "expires": "2025-10-22",
     "remaining": "unlimited",
-    "device_id_display": "CPU:BFEBFBFF|MB:HNZ-2022|BIOS:UNKNOWN_ | BFEBFBFF000406F1-HNZ-202207062022-UNKNOWN_BIOS-UNKNOWN_DISK"
+    "device_id_display": "Platform: Windows"
   }
 }
